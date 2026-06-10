@@ -144,6 +144,26 @@ function extractText(parts) {
   return parts.filter(p => p.type === "text").map(p => p.text).join("\n");
 }
 
+// ── formatting ──────────────────────────────────────────────────────────
+function formatSessionsGrouped(sessions, activeId) {
+  const groups = {};
+  sessions.forEach((s, i) => {
+    const dir = s.directory || "";
+    const dirLabel = dir.split(/[\/\\]/).filter(Boolean).pop() || dir || "?";
+    if (!groups[dirLabel]) groups[dirLabel] = [];
+    groups[dirLabel].push({ ...s, globalIndex: i });
+  });
+  const lines = [];
+  for (const [dir, items] of Object.entries(groups)) {
+    lines.push(`📁 ${dir} (${items.length})`);
+    for (const s of items) {
+      const active = activeId === s.id ? " ▶" : "  ";
+      lines.push(`  [${s.globalIndex}]${active} ${s.title}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 // ── user state ──────────────────────────────────────────────────────────
 function getUserState(userId) {
   if (!state.users) state.users = {};
@@ -167,13 +187,7 @@ async function handleCommand(userId, contextToken, text) {
           await ilinkSendText(userId, "No sessions found.", contextToken);
           return;
         }
-        const lines = sessions.map((s, i) => {
-          const dir = s.directory || "";
-          const dirLabel = dir.split(/[\/\\]/).filter(Boolean).pop() || dir || "?";
-          const active = us.activeSession === s.id ? " ▶" : "";
-          return `[${i}]${active} ${s.title}  @${dirLabel}  (${s.id})`;
-        });
-        await ilinkSendText(userId, `📋 ${sessions.length} sessions:\n${lines.join("\n")}`, contextToken);
+        await ilinkSendText(userId, formatSessionsGrouped(sessions, us.activeSession), contextToken);
         break;
       }
 
@@ -193,13 +207,7 @@ async function handleCommand(userId, contextToken, text) {
           if (sessions.length === 0) {
             await ilinkSendText(userId, "No sessions found.", contextToken);
           } else {
-            const lines = sessions.map((s, i) => {
-              const dir = s.directory || "";
-              const dirLabel = dir.split(/[\/\\]/).filter(Boolean).pop() || dir || "?";
-              const active = us.activeSession === s.id ? " ▶" : "";
-              return `[${i}]${active} ${s.title}  @${dirLabel}  (${s.id})`;
-            });
-            await ilinkSendText(userId, `📋 ${sessions.length} sessions:\n${lines.join("\n")}`, contextToken);
+            await ilinkSendText(userId, formatSessionsGrouped(sessions, us.activeSession), contextToken);
           }
           return;
         }
