@@ -145,23 +145,32 @@ function extractText(parts) {
 }
 
 // ── formatting ──────────────────────────────────────────────────────────
-function formatSessionsGrouped(sessions, activeId) {
+function getProjectGroups(sessions) {
   const groups = {};
+  const order = [];
   sessions.forEach((s, i) => {
     const dir = s.directory || "";
     const dirLabel = dir.split(/[\/\\]/).filter(Boolean).pop() || dir || "?";
-    if (!groups[dirLabel]) groups[dirLabel] = [];
+    if (!groups[dirLabel]) { groups[dirLabel] = []; order.push(dirLabel); }
     groups[dirLabel].push({ ...s, globalIndex: i });
   });
-  const lines = [];
-  for (const [dir, items] of Object.entries(groups)) {
-    lines.push(`[ ${dir} ] (${items.length})`);
-    for (const s of items) {
-      const active = activeId === s.id ? ">" : " ";
-      const title = s.title || "(untitled)";
-      lines.push(`  ${active} [${s.globalIndex}] ${title}`);
-    }
+  return { groups, order };
+}
+
+function formatProjectsList(groups, order) {
+  const lines = ["Projects:"];
+  order.forEach((dir, i) => lines.push(`  [${i}] ${dir} (${groups[dir].length})`));
+  lines.push("", "Reply with /list [number] or /list <name>");
+  return lines.join("\n");
+}
+
+function formatSessionsInProject(dir, items, activeId) {
+  const lines = [`[ ${dir} ] (${items.length})`];
+  for (const s of items) {
+    const active = activeId === s.id ? ">" : " ";
+    lines.push(`  ${active} [${s.globalIndex}] ${s.title || "(untitled)"}`);
   }
+  lines.push("", "Reply with /resume [number]");
   return lines.join("\n");
 }
 
@@ -188,7 +197,30 @@ async function handleCommand(userId, contextToken, text) {
           await ilinkSendText(userId, "No sessions found.", contextToken);
           return;
         }
-        await ilinkSendText(userId, formatSessionsGrouped(sessions, us.activeSession), contextToken);
+        const { groups, order } = getProjectGroups(sessions);
+        const arg = parts.slice(1).join(" ").trim();
+        if (!arg) {
+          await ilinkSendText(userId, formatProjectsList(groups, order), contextToken);
+          return;
+        }
+        if (/^\d+$/.test(arg)) {
+          const idx = parseInt(arg);
+          if (idx >= 0 && idx < order.length) {
+            const dir = order[idx];
+            await ilinkSendText(userId, formatSessionsInProject(dir, groups[dir], us.activeSession), contextToken);
+          } else {
+            await ilinkSendText(userId, `Project index ${idx} out of range (0-${order.length-1})`, contextToken);
+          }
+          return;
+        }
+        const lower = arg.toLowerCase();
+        const matchIdx = order.findIndex(d => d.toLowerCase().includes(lower));
+        if (matchIdx >= 0) {
+          const dir = order[matchIdx];
+          await ilinkSendText(userId, formatSessionsInProject(dir, groups[dir], us.activeSession), contextToken);
+        } else {
+          await ilinkSendText(userId, `No project matching "${arg}". Use /list to see all projects.`, contextToken);
+        }
         break;
       }
 
@@ -208,7 +240,8 @@ async function handleCommand(userId, contextToken, text) {
           if (sessions.length === 0) {
             await ilinkSendText(userId, "No sessions found.", contextToken);
           } else {
-            await ilinkSendText(userId, formatSessionsGrouped(sessions, us.activeSession), contextToken);
+            const { groups, order } = getProjectGroups(sessions);
+            await ilinkSendText(userId, formatProjectsList(groups, order), contextToken);
           }
           return;
         }
