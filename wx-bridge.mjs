@@ -14,7 +14,13 @@ const ILINK_TOKEN = process.env.ILINK_TOKEN || "db78a3e21099@im.bot:060000757ee1
 const ILINK_BASE  = process.env.ILINK_BASE  || "https://ilinkai.weixin.qq.com";
 const SERVE_URL   = process.env.SERVE_URL   || "http://127.0.0.1:4096";
 const SERVE_USER  = process.env.SERVE_USER  || "opencode";
-const SERVE_PASS  = process.env.SERVE_PASS  || process.env.OPENCODE_SERVER_PASSWORD || "";
+function getServePass() {
+  if (process.env.SERVE_PASS) return process.env.SERVE_PASS;
+  if (process.env.OPENCODE_SERVER_PASSWORD) return process.env.OPENCODE_SERVER_PASSWORD;
+  try { return readFileSync(resolve(DATA_DIR, "..", "serve-pass.txt"), "utf8").trim(); }
+  catch { return ""; }
+}
+const SERVE_PASS = getServePass();
 const POLL_MS     = parseInt(process.env.POLL_MS) || 30000;
 const DATA_DIR    = process.env.DATA_DIR   || resolve(process.env.USERPROFILE, ".cc-connect", "wx-bridge");
 const LOG_LEVEL   = process.env.LOG_LEVEL  || "info";
