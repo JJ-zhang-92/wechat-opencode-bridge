@@ -9,7 +9,7 @@ WeChat → ilink API → wx-bridge (Node.js) → OpenCode Serve API → SQLite s
 ## Features
 
 - **Full session management** — list all sessions across all directories, switch by fuzzy title search, create new sessions
-- **Natural-language resume** — `/resume Pt催化实验` finds your session without remembering IDs
+- **Natural-language resume** — `/resume 程序框图` finds your session without remembering IDs
 - **Instant fuzzy matching** — multi-keyword search against session titles and directories
 - **Custom system prompt** — set per-session system instructions via `/system`, injected through OpenCode's native `system` parameter
 - **Zero dependencies** — pure Node.js built-in modules only (`http`, `https`, `fs`, `child_process`, `crypto`)
