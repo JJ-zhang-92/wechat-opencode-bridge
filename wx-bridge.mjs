@@ -1,6 +1,7 @@
 // wx-bridge.mjs — WeChat ilink ↔ OpenCode Serve bridge
 // Uses correct ilink API format (from cc-connect source)
 // Session listing uses CLI bypass for cross-directory access
+// Message passing uses OpenCode SDK (no auth needed)
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { resolve, dirname } from "path";
@@ -12,18 +13,19 @@ import http from "http";
 // ── config ──────────────────────────────────────────────────────────────
 const ILINK_TOKEN = process.env.ILINK_TOKEN || "db78a3e21099@im.bot:060000757ee105b37c110dac179fa92a1c6db4";
 const ILINK_BASE  = process.env.ILINK_BASE  || "https://ilinkai.weixin.qq.com";
-const SERVE_URL   = process.env.SERVE_URL   || "http://127.0.0.1:4096";
-const SERVE_USER  = process.env.SERVE_USER  || "opencode";
-function getServePass() {
-  if (process.env.SERVE_PASS) return process.env.SERVE_PASS;
-  if (process.env.OPENCODE_SERVER_PASSWORD) return process.env.OPENCODE_SERVER_PASSWORD;
-  try { return readFileSync(resolve(DATA_DIR, "..", "serve-pass.txt"), "utf8").trim(); }
-  catch { return ""; }
-}
-const SERVE_PASS = getServePass();
+const SERVE_URL   = process.env.SERVE_URL   || "http://127.0.0.1:4097";
 const POLL_MS     = parseInt(process.env.POLL_MS) || 30000;
 const DATA_DIR    = process.env.DATA_DIR   || resolve(process.env.USERPROFILE, ".cc-connect", "wx-bridge");
 const LOG_LEVEL   = process.env.LOG_LEVEL  || "info";
+
+// ── SDK client (lazy init) ──────────────────────────────────────────────
+let _sdk = null;
+async function getSdk() {
+  if (_sdk) return _sdk;
+  const { createOpencodeClient } = await import("@opencode-ai/sdk/v2");
+  _sdk = createOpencodeClient({ baseUrl: SERVE_URL });
+  return _sdk;
+}
 
 // ── state ───────────────────────────────────────────────────────────────
 const statePath = resolve(DATA_DIR, "wx-sessions.json");
@@ -47,9 +49,6 @@ function log(level, msg, extra) {
   if (LOG_LEVEL === "debug" || level !== "debug") process.stderr.write(line + "\n");
   try { writeFileSync(logPath, line + "\n", { flag: "a" }); } catch {}
 }
-
-// ── auth ────────────────────────────────────────────────────────────────
-const authHeader = "Basic " + Buffer.from(`${SERVE_USER}:${SERVE_PASS}`).toString("base64");
 
 // ── http helpers ────────────────────────────────────────────────────────
 function httpRequest(method, url, body = null, extraHeaders = {}, timeout = 120000) {
@@ -109,11 +108,6 @@ async function ilinkSendText(to, text, contextToken) {
 }
 
 // ── serve API ───────────────────────────────────────────────────────────
-async function serveRequest(method, path, body = null, timeout = 120000) {
-  const headers = { Authorization: authHeader };
-  return httpRequest(method, `${SERVE_URL}${path}`, body, headers, timeout);
-}
-
 async function serveListAllSessions(limit = 30) {
   try {
     const output = execSync(`opencode session list --format json --max-count ${limit}`, {
@@ -131,18 +125,20 @@ async function serveListAllSessions(limit = 30) {
   }
 }
 
-async function serveCreateSession(title = "WeChat session") {
-  const r = await serveRequest("POST", "/session", { title });
-  if (r.status !== 200) throw new Error(`create session: HTTP ${r.status}`);
-  return r.data;
+async function serveSendMessage(sessionId, text, systemPrompt) {
+  const sdk = await getSdk();
+  const body = { sessionID: sessionId, parts: [{ type: "text", text }] };
+  if (systemPrompt) body.system = systemPrompt;
+  const result = await sdk.session.promptAsync(body);
+  if (result.error) throw new Error(`SDK error: ${result.error}`);
+  return result.data;
 }
 
-async function serveSendMessage(sessionId, text, systemPrompt) {
-  const body = { parts: [{ type: "text", text }] };
-  if (systemPrompt) body.system = systemPrompt;
-  const r = await serveRequest("POST", `/session/${sessionId}/message`, body, 600000);
-  if (r.status !== 200) throw new Error(`send message: HTTP ${r.status}`);
-  return r.data;
+async function serveCreateSession(title = "WeChat session") {
+  const sdk = await getSdk();
+  const result = await sdk.session.create({ title });
+  if (result.error) throw new Error(`SDK create: ${result.error}`);
+  return result.data;
 }
 
 function extractText(parts) {
