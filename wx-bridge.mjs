@@ -116,7 +116,7 @@ async function serveListAllSessions(limit = 30) {
     const all = JSON.parse(output || "[]");
     return all.map(s => ({
       id: s.id,
-      title: (s.title || "(untitled)").replace(/^New session - \d{4}-\d{2}-\d{2}T[\d:.]+Z$/, ""),
+      title: (s.title || "(untitled)").replace(/^New session - \d{4}-\d{2}-\d{2}T[\d:.]+Z$/, "(new)"),
       directory: s.directory || "",
     }));
   } catch (e) {
@@ -155,10 +155,11 @@ function formatSessionsGrouped(sessions, activeId) {
   });
   const lines = [];
   for (const [dir, items] of Object.entries(groups)) {
-    lines.push(`📁 ${dir} (${items.length})`);
+    lines.push(`[ ${dir} ] (${items.length})`);
     for (const s of items) {
-      const active = activeId === s.id ? " ▶" : "  ";
-      lines.push(`  [${s.globalIndex}]${active} ${s.title}`);
+      const active = activeId === s.id ? ">" : " ";
+      const title = s.title || "(untitled)";
+      lines.push(`  ${active} [${s.globalIndex}] ${title}`);
     }
   }
   return lines.join("\n");
