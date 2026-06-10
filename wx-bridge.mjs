@@ -116,7 +116,7 @@ async function serveListAllSessions(limit = 30) {
     const all = JSON.parse(output || "[]");
     return all.map(s => ({
       id: s.id,
-      title: s.title || "(untitled)",
+      title: (s.title || "(untitled)").replace(/^New session - \d{4}-\d{2}-\d{2}T[\d:.]+Z$/, ""),
       directory: s.directory || "",
     }));
   } catch (e) {
