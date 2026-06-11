@@ -232,8 +232,9 @@ function handleSSEEvent(event, data) {
     case "permission.asked": {
       const turn = activeTurns.get(sid);
       if (!turn) return;
-      pendingPermissions.set(sid, { permissionID: data.id, title: data.title || data.type || "Permission" });
-      ilinkSendText(turn.userId, `🔐 [${pendingPermissions.get(sid).title}]\n/confirm  /deny   or ask questions`, turn.contextToken).catch(()=>{});
+      const pt = { permissionID: data.id, title: data.title || data.type || "Permission" };
+      pendingPermissions.set(sid, pt);
+      ilinkSendText(turn.userId, `🔐 [${pt.title}]\n/confirm  /deny   or ask questions`, turn.contextToken).catch(()=>{});
       break;
     }
     case "message.part.updated": {
@@ -689,7 +690,7 @@ async function main() {
   // ── serve heartbeat ──────────────────────────────────────────────────
   for (let i = 0; i < 10; i++) {
     try {
-      const resp = await fetch(`${SERVE_URL}/global/health`);
+      const resp = await fetch(`${SERVE_URL}/global/health`, { signal: AbortSignal.timeout(5000) });
       if (resp.ok) { log("info", `serve ready (attempt ${i + 1})`); break; }
       throw new Error(`HTTP ${resp.status}`);
     } catch {
