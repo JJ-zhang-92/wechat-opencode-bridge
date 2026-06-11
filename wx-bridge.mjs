@@ -110,7 +110,8 @@ async function ilinkSendText(to, text, contextToken) {
 // ── serve API ───────────────────────────────────────────────────────────
 async function serveListAllSessions(limit = 30) {
   try {
-    const output = execSync(`opencode session list --format json --max-count ${limit}`, {
+    const OCODE = process.env.OPENCODE_BIN || "C:\\Users\\12415\\AppData\\Roaming\\npm\\node_modules\\opencode-ai\\bin\\opencode.exe";
+    const output = execSync(`"${OCODE}" session list --format json --max-count ${limit}`, {
       encoding: "utf8", timeout: 10000, env: process.env,
     });
     const all = JSON.parse(output || "[]");
