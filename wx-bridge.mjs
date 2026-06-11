@@ -654,7 +654,7 @@ async function handleMessage(msg) {
       return;
     }
     pendingPermissions.delete(us.activeSession);
-    await ilinkSendText(userId, `❌ Denied previous request.\nForwarding: "${text.slice(0, 50)}${text.length > 50 ? "..." : ""}"`, contextToken);
+    await ilinkSendText(userId, `❌ Denied previous request.\nForwarding: "${text.slice(0, 50)}${text.length > 50 ? "..." : ""}"\n\nRe-send your original message to retry.`, contextToken);
   }
 
   try {
