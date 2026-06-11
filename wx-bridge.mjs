@@ -568,6 +568,7 @@ async function handleCommand(userId, contextToken, text) {
           await ilinkSendText(userId, "⏳ Compacting...", contextToken);
           const sdk = await getSdk();
           await sdk.session.abort({ sessionID: us.activeSession });
+          await sleep(3000); // wait for abort to settle
           const result = await sdk.session.promptAsync({
             sessionID: us.activeSession,
             parts: [{ type: "text", text: "Summarize the current conversation context in one paragraph, preserving all key facts, decisions, and pending tasks." }],

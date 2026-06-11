@@ -26,7 +26,7 @@ WeChat → ilink API → wx-bridge (Node.js) → OpenCode Serve API → SQLite s
 
 ```bash
 # 1. Ensure OpenCode serve is running
-opencode serve --port 4096 --hostname 127.0.0.1
+opencode serve --port 4097 --hostname 127.0.0.1
 
 # 2. Set your ilink token
 set ILINK_TOKEN=your-bot-id@im.bot:your-token

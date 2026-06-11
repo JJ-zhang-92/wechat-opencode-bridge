@@ -26,7 +26,7 @@
 
 ```bash
 # 1. 启动 OpenCode serve
-opencode serve --port 4096 --hostname 127.0.0.1
+opencode serve --port 4097 --hostname 127.0.0.1
 
 # 2. 设置 ilink token
 set ILINK_TOKEN=your-bot-id@im.bot:your-token
