@@ -188,13 +188,86 @@ async function serveListAllSessions(limit = 100) {
   }
 }
 
-async function serveSendMessage(sessionId, text, systemPrompt) {
-  const sdk = await getSdk();
-  const body = { sessionID: sessionId, parts: [{ type: "text", text }] };
+async function serveSendMessageAsync(sessionId, text, systemPrompt) {
+  const body = { parts: [{ type: "text", text }] };
   if (systemPrompt) body.system = systemPrompt;
-  const result = await sdk.session.promptAsync(body);
-  if (result.error) throw new Error(`SDK error: ${result.error}`);
-  return result.data;
+  const resp = await fetch(`${SERVE_URL}/session/${sessionId}/prompt_async`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  if (!resp.ok && resp.status !== 204) throw new Error(`prompt_async HTTP ${resp.status}`);
+}
+
+// ── SSE event handling (permissions + async replies) ────────────────────
+const activeTurns = new Map();        // sessionID → { userId, contextToken }
+const pendingPermissions = new Map();  // sessionID → { permissionID, title }
+const turnReplies = new Map();         // sessionID → { text: "" }
+
+async function startSSEListener() {
+  while (running) {
+    try {
+      const resp = await fetch(`${SERVE_URL}/event`);
+      if (!resp.ok) throw new Error(`SSE HTTP ${resp.status}`);
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "", currentEvent = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n"); buf = lines.pop() || "";
+        for (const line of lines) {
+          if (line.startsWith("event: ")) { currentEvent = line.slice(7).trim(); continue; }
+          if (!line.startsWith("data: ")) continue;
+          try { handleSSEEvent(currentEvent, JSON.parse(line.slice(6))); } catch {}
+        }
+      }
+    } catch (e) { log("warn", "SSE error", { error: e.message }); }
+    await sleep(5000);
+  }
+}
+
+function handleSSEEvent(event, data) {
+  const sid = data.sessionID;
+  switch (event) {
+    case "permission.asked": {
+      const turn = activeTurns.get(sid);
+      if (!turn) return;
+      pendingPermissions.set(sid, { permissionID: data.id, title: data.title || data.type || "Permission" });
+      ilinkSendText(turn.userId, `🔐 [${pendingPermissions.get(sid).title}]\n/confirm  /deny   or ask questions`, turn.contextToken).catch(()=>{});
+      break;
+    }
+    case "message.part.updated": {
+      if (!data.part || data.part.type !== "text") return;
+      if (!activeTurns.has(sid)) return;
+      const r = turnReplies.get(sid) || { text: "" };
+      r.text += (data.part.text || "");
+      turnReplies.set(sid, r);
+      break;
+    }
+    case "session.idle": {
+      const turn = activeTurns.get(sid);
+      if (!turn) return;
+      const reply = turnReplies.get(sid);
+      const text = reply?.text || "";
+      turnReplies.delete(sid);
+      activeTurns.delete(sid);
+      pendingPermissions.delete(sid);
+      if (text) {
+        const MAX_BYTES = 3500;
+        let pos = 0;
+        while (pos < text.length) {
+          let end = pos + 1;
+          while (end <= text.length && Buffer.byteLength(text.slice(pos, end), "utf8") <= MAX_BYTES) end++;
+          end--;
+          ilinkSendText(turn.userId, text.slice(pos, end), turn.contextToken).catch(()=>{});
+          pos = end;
+        }
+      } else {
+        ilinkSendText(turn.userId, "✅ Done (no text output).", turn.contextToken).catch(()=>{});
+      }
+      break;
+    }
+  }
 }
 
 async function serveCreateSession(title = "WeChat session") {
@@ -400,7 +473,38 @@ async function handleCommand(userId, contextToken, text) {
         try {
           const sdk = await getSdk();
           await sdk.session.abort({ sessionID: us.activeSession });
+          activeTurns.delete(us.activeSession);
+          pendingPermissions.delete(us.activeSession);
+          turnReplies.delete(us.activeSession);
           await ilinkSendText(userId, "✅ Interrupt signal sent.", contextToken);
+        } catch (e) {
+          await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+        }
+        break;
+      }
+
+      case "/confirm": {
+        if (!us.activeSession) { await ilinkSendText(userId, "No active session.", contextToken); return; }
+        const pp = pendingPermissions.get(us.activeSession);
+        if (!pp) { await ilinkSendText(userId, "No pending permission to confirm.", contextToken); return; }
+        try {
+          const sdk = await getSdk();
+          await sdk.permission.respond({ sessionID: us.activeSession, permissionID: pp.permissionID, response: "once" });
+          await ilinkSendText(userId, "✅ Approved.", contextToken);
+        } catch (e) {
+          await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+        }
+        break;
+      }
+
+      case "/deny": {
+        if (!us.activeSession) { await ilinkSendText(userId, "No active session.", contextToken); return; }
+        const pp = pendingPermissions.get(us.activeSession);
+        if (!pp) { await ilinkSendText(userId, "No pending permission to deny.", contextToken); return; }
+        try {
+          const sdk = await getSdk();
+          await sdk.permission.respond({ sessionID: us.activeSession, permissionID: pp.permissionID, response: "reject" });
+          await ilinkSendText(userId, "❌ Denied.", contextToken);
         } catch (e) {
           await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
         }
@@ -463,12 +567,15 @@ async function handleCommand(userId, contextToken, text) {
           await ilinkSendText(userId, "⏳ Compacting...", contextToken);
           const sdk = await getSdk();
           await sdk.session.abort({ sessionID: us.activeSession });
-          const summary = await serveSendMessage(us.activeSession,
-            "Summarize the current conversation context in one paragraph, preserving all key facts, decisions, and pending tasks.", "");
+          const result = await sdk.session.promptAsync({
+            sessionID: us.activeSession,
+            parts: [{ type: "text", text: "Summarize the current conversation context in one paragraph, preserving all key facts, decisions, and pending tasks." }],
+          });
+          if (result.error) throw new Error(`SDK error: ${result.error}`);
           const newSession = await serveCreateSession("(compact) " + (new Date().toLocaleDateString()));
           us.activeSession = newSession.id;
           saveState(state);
-          const summaryText = extractText(summary.parts) || "(no summary)";
+          const summaryText = extractText(result.data.parts) || "(no summary)";
           await ilinkSendText(userId, `✅ Compacted.\nNew session: ${newSession.id}\nSummary:\n${summaryText}`, contextToken);
         } catch (e) {
           await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
@@ -483,7 +590,7 @@ async function handleCommand(userId, contextToken, text) {
 
       case "/help": {
         await ilinkSendText(userId,
-          "🛠 Commands:\n/list — Browse projects/sessions\n/new [title] — Create session\n/resume — List / fuzzy switch\n/stop — Interrupt current task\n/search <word> — Search sessions\n/delete <id> — Delete session\n/compact — Compress context to new session\n/model [name] — Show/switch model\n/system — Show/set system prompt\n/current — Show current state\n/help — This help",
+          "🛠 Commands:\n/list — Browse projects/sessions\n/new [title] — Create session\n/resume — List / fuzzy switch\n/stop — Interrupt current task\n/confirm — Approve permission\n/deny — Deny permission\n/search <word> — Search sessions\n/delete <id> — Delete session\n/compact — Compress context to new session\n/model [name] — Show/switch model\n/system — Show/set system prompt\n/current — Show current state\n/help — This help",
           contextToken);
         break;
       }
@@ -536,24 +643,23 @@ async function handleMessage(msg) {
     return;
   }
 
+  // Auto-deny pending permission if user asks a question instead
+  if (pendingPermissions.has(us.activeSession) && !text.startsWith("/confirm") && !text.startsWith("/deny")) {
+    const pp = pendingPermissions.get(us.activeSession);
+    try {
+      const sdk = await getSdk();
+      await sdk.permission.respond({ sessionID: us.activeSession, permissionID: pp.permissionID, response: "reject" });
+    } catch {}
+    pendingPermissions.delete(us.activeSession);
+    await ilinkSendText(userId, `❌ Denied previous request.\nForwarding: "${text.slice(0, 50)}${text.length > 50 ? "..." : ""}"`, contextToken);
+  }
+
   try {
     inflight++;
+    await serveSendMessageAsync(us.activeSession, text, us.systemPrompt);
+    activeTurns.set(us.activeSession, { userId, contextToken });
+    turnReplies.set(us.activeSession, { text: "" });
     await ilinkSendText(userId, "⏳ Processing...", contextToken);
-    const result = await serveSendMessage(us.activeSession, text, us.systemPrompt);
-    const reply = extractText(result.parts);
-    if (reply) {
-      const MAX_BYTES = 3500;
-      let pos = 0;
-      while (pos < reply.length) {
-        let end = pos + 1;
-        while (end <= reply.length && Buffer.byteLength(reply.slice(pos, end), "utf8") <= MAX_BYTES) end++;
-        end--;
-        await ilinkSendText(userId, reply.slice(pos, end), contextToken);
-        pos = end;
-      }
-    } else {
-      await ilinkSendText(userId, "✅ Done (no text output).", contextToken);
-    }
   } catch (e) {
     log("error", "serve msg failed", { error: e.message });
     await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
@@ -589,6 +695,9 @@ async function main() {
       await sleep(3000);
     }
   }
+
+  log("info", "starting SSE listener");
+  startSSEListener().catch(e => log("error", "SSE listener crashed", { error: e.message }));
 
   let buf = "";
   let backoff = 1000;
