@@ -75,6 +75,30 @@ All settings via environment variables:
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full data flow and component diagram.
 
+## Design
+
+Built for **single-user, single-agent** usage. The bridge processes messages
+sequentially — each message is `await`ed before the next one begins. This
+eliminates session-write races, state corruption, and concurrent request
+overload without adding queues or locks.
+
+- No concurrent message processing — one message at a time per user
+- No state race conditions — writes happen synchronously within a turn
+- No queue or backpressure needed — single user cannot overload
+
+## Limitations
+
+- Designed for **personal use** only. Multi-user scenarios require adding
+  request serialization and state locking.
+- **Windows-only** — `opencode.exe` path detection uses Windows conventions.
+  macOS/Linux users must set `OPENCODE_BIN` explicitly.
+- **OpenCode-only** — the bridge talks to OpenCode Serve via SDK and CLI.
+- Session listing uses `execSync` which blocks the event loop for ~1 second.
+  Acceptable for single-user; would need async for concurrent use.
+- Inflight tracking is statistical only (0 or 1), no rate limiting.
+- Default session titles like "New session - ..." are stripped to "(new)" —
+  if you intentionally keep timestamps, name your sessions.
+
 ## FAQ
 
 **Q: First message gets "No active session"?**

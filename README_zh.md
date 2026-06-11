@@ -75,6 +75,27 @@ node wx-bridge.mjs
 
 详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
+## 设计理念
+
+为**单人、单 Agent**使用设计。Bridge 串行处理消息——每条消息 `await` 完成后才处理下一条，
+天然消除了 session 写入竞争、状态损坏和并发过载，无需引入队列或锁。
+
+- 消息串行处理 — 每用户同一时间只有一条消息在执行
+- 无状态写入竞争 — 状态更新在同步执行流中完成
+- 无需限流 — 单人使用无法造成过载
+
+## 使用限制
+
+- 仅为**个人使用**设计。多用户场景需要增加请求串行化和状态锁。
+- **仅支持 Windows** — `opencode.exe` 路径检测使用 Windows 规范。
+  macOS/Linux 用户需手动设置 `OPENCODE_BIN`。
+- **仅支持 OpenCode** — Bridge 通过 SDK 和 CLI 与 OpenCode Serve 通信。
+- Session 列表使用 `execSync`，会阻塞 event loop 约 1 秒。
+  单人使用可接受，并发场景需改为异步。
+- Inflight 跟踪仅为统计用途（0 或 1），无限流机制。
+- 默认标题 "New session - ..." 会被截为 "(new)"，
+  如需保留时间戳请自定义 session 名。
+
 ## 常见问题
 
 **Q: 首次发消息提示"No active session"？**
