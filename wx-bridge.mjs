@@ -27,6 +27,16 @@ const ILINK_BASE  = process.env.ILINK_BASE  || "https://ilinkai.weixin.qq.com";
 const SERVE_URL   = process.env.SERVE_URL   || "http://127.0.0.1:4097";
 const POLL_MS     = parseInt(process.env.POLL_MS) || 30000;
 
+function getAllowFrom() {
+  if (process.env.WX_ALLOW_FROM) return process.env.WX_ALLOW_FROM;
+  try {
+    const toml = readFileSync(resolve(process.env.USERPROFILE, ".cc-connect", "config.toml"), "utf8");
+    const m = toml.match(/allow_from\s*=\s*"([^"]+)"/);
+    return m ? m[1] : "";
+  } catch { return ""; }
+}
+const ALLOW_FROM = getAllowFrom();
+
 // ── SDK client (lazy init) ──────────────────────────────────────────────
 let _sdk = null;
 async function getSdk() {
@@ -68,7 +78,14 @@ function log(level, msg, extra) {
   const ts = new Date().toISOString();
   const line = `${ts} [${level.toUpperCase()}] ${msg}` + (extra ? " " + JSON.stringify(extra) : "");
   if (LOG_LEVEL === "debug" || level !== "debug") process.stderr.write(line + "\n");
-  try { writeFileSync(logPath, line + "\n", { flag: "a" }); } catch {}
+  try {
+    if (existsSync(logPath) && readFileSync(logPath, "utf8").length > 10 * 1024 * 1024) {
+      try { unlinkSync(logPath + ".1"); } catch {}
+      try { writeFileSync(logPath + ".1", readFileSync(logPath)); } catch {}
+      writeFileSync(logPath, "");
+    }
+    writeFileSync(logPath, line + "\n", { flag: "a" });
+  } catch {}
 }
 
 // ── http helpers ────────────────────────────────────────────────────────
@@ -395,6 +412,14 @@ async function handleCommand(userId, contextToken, text) {
           if (idx >= 0 && idx < sessions.length) session = sessions[idx];
         }
         if (!session) { await ilinkSendText(userId, `Session not found: ${target}`, contextToken); return; }
+        if (us._pendingDelete !== session.id) {
+          us._pendingDelete = session.id;
+          saveState(state);
+          await ilinkSendText(userId, `⚠️ Confirm delete: ${session.title} (${session.id})\nReply with /delete ${target} again to confirm.`, contextToken);
+          return;
+        }
+        us._pendingDelete = null;
+        saveState(state);
         try {
           const sdk = await getSdk();
           await sdk.session.delete({ sessionID: session.id });
@@ -463,6 +488,12 @@ async function handleMessage(msg) {
   if (!text) return;
 
   log("info", `msg ${userId.slice(0,16)}...`, { text: text.slice(0, 100) });
+
+  // Whitelist check
+  if (ALLOW_FROM && userId !== ALLOW_FROM) {
+    log("warn", `blocked ${userId.slice(0,16)}...`);
+    return;
+  }
 
   // Slash command
   if (text.startsWith("/")) {
