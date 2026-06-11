@@ -110,7 +110,8 @@ function httpRequest(method, url, body = null, extraHeaders = {}, timeout = 1200
   const agent = isHttps ? keepAliveAgent : new http.Agent({ keepAlive: true });
 
   const headers = { "Content-Type": "application/json", ...extraHeaders };
-  if (body) headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(body), "utf8"));
+  const bodyStr = body ? JSON.stringify(body) : null;
+  if (bodyStr) headers["Content-Length"] = String(Buffer.byteLength(bodyStr, "utf8"));
 
   return new Promise((resolve, reject) => {
     const req = mod.request({
@@ -127,7 +128,7 @@ function httpRequest(method, url, body = null, extraHeaders = {}, timeout = 1200
     });
     req.on("error", reject);
     req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-    if (body) req.write(JSON.stringify(body));
+    if (bodyStr) req.write(bodyStr);
     req.end();
   });
 }
@@ -160,9 +161,18 @@ async function ilinkSendText(to, text, contextToken) {
 }
 
 // ── serve API ───────────────────────────────────────────────────────────
+function findOpenCode() {
+  if (process.env.OPENCODE_BIN) return process.env.OPENCODE_BIN;
+  const candidates = [
+    resolve(process.env.APPDATA || "", "npm", "node_modules", "opencode-ai", "bin", "opencode.exe"),
+    resolve(process.env.LOCALAPPDATA || "", "npm", "node_modules", "opencode-ai", "bin", "opencode.exe"),
+  ];
+  for (const c of candidates) if (existsSync(c)) return c;
+  return candidates[0]; // best-effort fallback
+}
+const OCODE = findOpenCode();
 async function serveListAllSessions(limit = 100) {
   try {
-    const OCODE = process.env.OPENCODE_BIN || (existsSync(resolve(process.env.APPDATA || "", "npm", "node_modules", "opencode-ai", "bin", "opencode.exe")) ? resolve(process.env.APPDATA, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe") : resolve(process.env.LOCALAPPDATA || "", "npm", "node_modules", "opencode-ai", "bin", "opencode.exe"));
     const output = execSync(`"${OCODE}" session list --format json --max-count ${limit}`, {
       encoding: "utf8", timeout: 10000, env: process.env,
     });
@@ -406,9 +416,10 @@ async function handleCommand(userId, contextToken, text) {
         if (matches.length === 0) {
           await ilinkSendText(userId, `No sessions matching "${query}"`, contextToken);
         } else {
-          const lines = matches.map((s, i) => {
+          const idMap = new Map(sessions.map((s, i) => [s.id, i]));
+          const lines = matches.map(s => {
             const dir = s.directory.split(/[\/\\]/).filter(Boolean).pop() || "?";
-            return `[${sessions.findIndex(x => x.id === s.id)}] ${s.title} @${dir}`;
+            return `[${idMap.get(s.id)}] ${s.title} @${dir}`;
           });
           await ilinkSendText(userId, `🔍 ${matches.length} matches:\n${lines.join("\n")}`, contextToken);
         }
@@ -499,7 +510,11 @@ async function handleMessage(msg) {
     }
   }
   text = text.trim();
-  if (!text) return;
+  const hasMedia = Array.isArray(msg.item_list) && msg.item_list.some(item => item.type === 2 || item.type === 3 || item.type === 4 || item.type === 5);
+  if (!text) {
+    if (hasMedia) await ilinkSendText(userId, "📷 收到图片/文件，当前模型不支持多媒体处理。请用文字描述。", contextToken);
+    return;
+  }
 
   log("info", `msg ${userId.slice(0,16)}...`, { text: text.slice(0, 100) });
 
@@ -593,7 +608,7 @@ async function main() {
       for (const msg of (resp.data.msgs || [])) { if (msg.message_type === 1) await handleMessage(msg); }
     } catch (e) {
       log("warn", "poll error", { error: e.message });
-      backoff = Math.min(backoff || 1000 * 2, maxBackoff);
+      backoff = Math.min((backoff || 1000) * 2, maxBackoff);
       await sleep(backoff);
     }
   }
