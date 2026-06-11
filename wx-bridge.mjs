@@ -643,13 +643,15 @@ async function handleMessage(msg) {
     return;
   }
 
-  // Auto-deny pending permission if user asks a question instead
-  if (pendingPermissions.has(us.activeSession) && !text.startsWith("/confirm") && !text.startsWith("/deny")) {
+  if (pendingPermissions.has(us.activeSession)) {
     const pp = pendingPermissions.get(us.activeSession);
     try {
       const sdk = await getSdk();
       await sdk.permission.respond({ sessionID: us.activeSession, permissionID: pp.permissionID, response: "reject" });
-    } catch {}
+    } catch {
+      log("warn", "auto-deny failed, keeping permission pending");
+      return;
+    }
     pendingPermissions.delete(us.activeSession);
     await ilinkSendText(userId, `❌ Denied previous request.\nForwarding: "${text.slice(0, 50)}${text.length > 50 ? "..." : ""}"`, contextToken);
   }
