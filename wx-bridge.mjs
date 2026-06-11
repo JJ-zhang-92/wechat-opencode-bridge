@@ -3,8 +3,8 @@
 // Session listing uses CLI bypass for cross-directory access
 // Message passing uses OpenCode SDK (no auth needed)
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
-import { resolve, dirname } from "path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, statSync } from "fs";
+import { resolve } from "path";
 import { execSync } from "child_process";
 import { randomUUID } from "crypto";
 import https from "https";
@@ -74,7 +74,7 @@ function loadState() {
   catch { return {}; }
 }
 function saveState(s) {
-  writeFileSync(statePath, JSON.stringify(s, null, 2));
+  try { writeFileSync(statePath, JSON.stringify(s, null, 2)); } catch {}
 }
 
 let state = loadState();
@@ -86,15 +86,19 @@ function log(level, msg, extra) {
   const ts = new Date().toISOString();
   const line = `${ts} [${level.toUpperCase()}] ${msg}` + (extra ? " " + JSON.stringify(extra) : "");
   if (LEVELS[level] <= LOG_THRESHOLD) process.stderr.write(line + "\n");
+  logCount = (logCount + 1) % 100;
   try {
-    if (existsSync(logPath) && readFileSync(logPath, "utf8").length > 10 * 1024 * 1024) {
-      try { unlinkSync(logPath + ".1"); } catch {}
-      try { writeFileSync(logPath + ".1", readFileSync(logPath)); } catch {}
-      writeFileSync(logPath, "");
+    if (logCount === 0 && existsSync(logPath)) {
+      try { if (statSync(logPath).size > 10 * 1024 * 1024) {
+        try { unlinkSync(logPath + ".1"); } catch {}
+        try { writeFileSync(logPath + ".1", readFileSync(logPath)); } catch {}
+        writeFileSync(logPath, "");
+      }} catch {}
     }
     writeFileSync(logPath, line + "\n", { flag: "a" });
   } catch {}
 }
+let logCount = 0;
 
 // ── http helpers ────────────────────────────────────────────────────────
 const keepAliveAgent = new https.Agent({ keepAlive: true });
@@ -158,7 +162,7 @@ async function ilinkSendText(to, text, contextToken) {
 // ── serve API ───────────────────────────────────────────────────────────
 async function serveListAllSessions(limit = 100) {
   try {
-    const OCODE = process.env.OPENCODE_BIN || "C:\\Users\\12415\\AppData\\Roaming\\npm\\node_modules\\opencode-ai\\bin\\opencode.exe";
+    const OCODE = process.env.OPENCODE_BIN || (existsSync(resolve(process.env.APPDATA || "", "npm", "node_modules", "opencode-ai", "bin", "opencode.exe")) ? resolve(process.env.APPDATA, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe") : resolve(process.env.LOCALAPPDATA || "", "npm", "node_modules", "opencode-ai", "bin", "opencode.exe"));
     const output = execSync(`"${OCODE}" session list --format json --max-count ${limit}`, {
       encoding: "utf8", timeout: 10000, env: process.env,
     });
@@ -265,7 +269,8 @@ async function handleCommand(userId, contextToken, text) {
           return;
         }
         const lower = arg.toLowerCase();
-        const matchIdx = order.findIndex(d => d.toLowerCase().includes(lower));
+        const keywords = lower.split(/\s+/).filter(Boolean);
+        const matchIdx = order.findIndex(d => keywords.every(k => d.toLowerCase().includes(k)));
         if (matchIdx >= 0) {
           const dir = order[matchIdx];
           await ilinkSendText(userId, formatSessionsInProject(dir, groups[dir], us.activeSession), contextToken);
@@ -326,7 +331,7 @@ async function handleCommand(userId, contextToken, text) {
         // Fuzzy match by title + directory
         const matches = sessions.filter(s => {
           const haystack = `${s.title} ${s.directory}`.toLowerCase();
-          const keywords = lowerQ.split(/\s+/);
+          const keywords = lowerQ.split(/\s+/).filter(Boolean);
           return keywords.every(k => haystack.includes(k));
         });
         if (matches.length === 1) {
@@ -403,7 +408,7 @@ async function handleCommand(userId, contextToken, text) {
         } else {
           const lines = matches.map((s, i) => {
             const dir = s.directory.split(/[\/\\]/).filter(Boolean).pop() || "?";
-            return `[${sessions.indexOf(s)}] ${s.title} @${dir}`;
+            return `[${sessions.findIndex(x => x.id === s.id)}] ${s.title} @${dir}`;
           });
           await ilinkSendText(userId, `🔍 ${matches.length} matches:\n${lines.join("\n")}`, contextToken);
         }
@@ -565,7 +570,7 @@ async function main() {
       if (resp.ok) { log("info", `serve ready (attempt ${i + 1})`); break; }
       throw new Error(`HTTP ${resp.status}`);
     } catch {
-      if (i === 9) { log("error", "serve unreachable after 10 attempts, exiting"); process.exit(1); }
+      if (i === 9) { log("error", "serve unreachable after 10 attempts, exiting"); try { unlinkSync(PID_FILE); } catch {} process.exit(1); }
       await sleep(3000);
     }
   }
@@ -584,16 +589,12 @@ async function main() {
         continue;
       }
       backoff = 1000;
-
       if (resp.data.get_updates_buf) buf = resp.data.get_updates_buf;
-
-      for (const msg of (resp.data.msgs || [])) {
-        if (msg.message_type === 1) await handleMessage(msg);
-      }
+      for (const msg of (resp.data.msgs || [])) { if (msg.message_type === 1) await handleMessage(msg); }
     } catch (e) {
       log("warn", "poll error", { error: e.message });
-      await sleep(Math.min(backoff, maxBackoff));
-      backoff = Math.min(backoff * 2, maxBackoff);
+      backoff = Math.min(backoff || 1000 * 2, maxBackoff);
+      await sleep(backoff);
     }
   }
   log("info", "wx-bridge stopped");
