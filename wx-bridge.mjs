@@ -129,7 +129,7 @@ async function ilinkSendText(to, text, contextToken) {
 }
 
 // ── serve API ───────────────────────────────────────────────────────────
-async function serveListAllSessions(limit = 30) {
+async function serveListAllSessions(limit = 100) {
   try {
     const OCODE = process.env.OPENCODE_BIN || "C:\\Users\\12415\\AppData\\Roaming\\npm\\node_modules\\opencode-ai\\bin\\opencode.exe";
     const output = execSync(`"${OCODE}" session list --format json --max-count ${limit}`, {
@@ -216,7 +216,7 @@ async function handleCommand(userId, contextToken, text) {
   try {
     switch (cmd) {
       case "/list": {
-        const sessions = await serveListAllSessions(30);
+        const sessions = await serveListAllSessions();
         if (sessions.length === 0) {
           await ilinkSendText(userId, "No sessions found.", contextToken);
           return;
@@ -259,7 +259,7 @@ async function handleCommand(userId, contextToken, text) {
 
       case "/resume": {
         const query = parts.slice(1).join(" ").trim();
-        const sessions = await serveListAllSessions(30);
+        const sessions = await serveListAllSessions();
         if (!query) {
           if (sessions.length === 0) {
             await ilinkSendText(userId, "No sessions found.", contextToken);
@@ -368,7 +368,7 @@ async function handleCommand(userId, contextToken, text) {
       case "/search": {
         const query = parts.slice(1).join(" ").trim();
         if (!query) { await ilinkSendText(userId, "Usage: /search <keyword>", contextToken); return; }
-        const sessions = await serveListAllSessions(30);
+        const sessions = await serveListAllSessions();
         const lowerQ = query.toLowerCase();
         const matches = sessions.filter(s => `${s.title} ${s.directory}`.toLowerCase().includes(lowerQ));
         if (matches.length === 0) {
