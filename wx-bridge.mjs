@@ -3,7 +3,7 @@
 // Session listing uses CLI bypass for cross-directory access
 // Message passing uses OpenCode SDK (no auth needed)
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
 import { resolve, dirname } from "path";
 import { execSync } from "child_process";
 import { randomUUID } from "crypto";
@@ -11,12 +11,21 @@ import https from "https";
 import http from "http";
 
 // ── config ──────────────────────────────────────────────────────────────
-const ILINK_TOKEN = process.env.ILINK_TOKEN || "db78a3e21099@im.bot:060000757ee105b37c110dac179fa92a1c6db4";
+const DATA_DIR    = process.env.DATA_DIR   || resolve(process.env.USERPROFILE, ".cc-connect", "wx-bridge");
+const LOG_LEVEL   = process.env.LOG_LEVEL  || "info";
+
+function getToken() {
+  if (process.env.ILINK_TOKEN) return process.env.ILINK_TOKEN;
+  try {
+    const toml = readFileSync(resolve(process.env.USERPROFILE, ".cc-connect", "config.toml"), "utf8");
+    const m = toml.match(/token\s*=\s*"([^"]+)"/);
+    return m ? m[1] : "";
+  } catch { return ""; }
+}
+const ILINK_TOKEN = getToken();
 const ILINK_BASE  = process.env.ILINK_BASE  || "https://ilinkai.weixin.qq.com";
 const SERVE_URL   = process.env.SERVE_URL   || "http://127.0.0.1:4097";
 const POLL_MS     = parseInt(process.env.POLL_MS) || 30000;
-const DATA_DIR    = process.env.DATA_DIR   || resolve(process.env.USERPROFILE, ".cc-connect", "wx-bridge");
-const LOG_LEVEL   = process.env.LOG_LEVEL  || "info";
 
 // ── SDK client (lazy init) ──────────────────────────────────────────────
 let _sdk = null;
@@ -27,11 +36,23 @@ async function getSdk() {
   return _sdk;
 }
 
+// ── single-instance lock ────────────────────────────────────────────────
+const PID_FILE = resolve(DATA_DIR, "bridge.pid");
+if (existsSync(PID_FILE)) {
+  try {
+    const oldPid = parseInt(readFileSync(PID_FILE, "utf8"));
+    process.kill(oldPid, 0);
+    process.stderr.write("bridge already running, exiting\n");
+    process.exit(1);
+  } catch { /* old process dead, continue */ }
+}
+mkdirSync(DATA_DIR, { recursive: true });
+writeFileSync(PID_FILE, String(process.pid));
+process.on("exit", () => { try { unlinkSync(PID_FILE); } catch {} });
+
 // ── state ───────────────────────────────────────────────────────────────
 const statePath = resolve(DATA_DIR, "wx-sessions.json");
 const logPath   = resolve(DATA_DIR, "bridge.log");
-
-mkdirSync(DATA_DIR, { recursive: true });
 
 function loadState() {
   try { return existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : {}; }
@@ -329,6 +350,39 @@ async function handleCommand(userId, contextToken, text) {
         break;
       }
 
+      case "/stop": {
+        if (!us.activeSession) {
+          await ilinkSendText(userId, "No active session to stop.", contextToken);
+          return;
+        }
+        try {
+          const sdk = await getSdk();
+          await sdk.session.abort({ sessionID: us.activeSession });
+          await ilinkSendText(userId, "✅ Interrupt signal sent.", contextToken);
+        } catch (e) {
+          await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+        }
+        break;
+      }
+
+      case "/search": {
+        const query = parts.slice(1).join(" ").trim();
+        if (!query) { await ilinkSendText(userId, "Usage: /search <keyword>", contextToken); return; }
+        const sessions = await serveListAllSessions(30);
+        const lowerQ = query.toLowerCase();
+        const matches = sessions.filter(s => `${s.title} ${s.directory}`.toLowerCase().includes(lowerQ));
+        if (matches.length === 0) {
+          await ilinkSendText(userId, `No sessions matching "${query}"`, contextToken);
+        } else {
+          const lines = matches.map((s, i) => {
+            const dir = s.directory.split(/[\/\\]/).filter(Boolean).pop() || "?";
+            return `[${sessions.indexOf(s)}] ${s.title} @${dir}`;
+          });
+          await ilinkSendText(userId, `🔍 ${matches.length} matches:\n${lines.join("\n")}`, contextToken);
+        }
+        break;
+      }
+
       case "/current": {
         await ilinkSendText(userId, `Session: ${us.activeSession || "(none)"}\nModel: ${us.model}`, contextToken);
         break;
@@ -336,7 +390,7 @@ async function handleCommand(userId, contextToken, text) {
 
       case "/help": {
         await ilinkSendText(userId,
-          "🛠 Commands:\n/list — List all sessions\n/new [title] — Create session\n/resume — List / fuzzy switch session\n/model [name] — Show/switch model\n/system — Show/set system prompt\n/current — Show current state\n/help — This help",
+          "🛠 Commands:\n/list — Browse projects/sessions\n/new [title] — Create session\n/resume — List / fuzzy switch\n/stop — Interrupt current task\n/search <word> — Search sessions\n/model [name] — Show/switch model\n/system — Show/set system prompt\n/current — Show current state\n/help — This help",
           contextToken);
         break;
       }
