@@ -41,8 +41,13 @@ const ALLOW_FROM = getAllowFrom();
 let _sdk = null;
 async function getSdk() {
   if (_sdk) return _sdk;
-  const { createOpencodeClient } = await import("@opencode-ai/sdk/v2");
-  _sdk = createOpencodeClient({ baseUrl: SERVE_URL });
+  try {
+    const { createOpencodeClient } = await import("@opencode-ai/sdk/v2");
+    _sdk = createOpencodeClient({ baseUrl: SERVE_URL });
+  } catch (e) {
+    log("error", "SDK import failed — install @opencode-ai/sdk", { error: e.message });
+    throw e;
+  }
   return _sdk;
 }
 
@@ -74,10 +79,13 @@ function saveState(s) {
 
 let state = loadState();
 
+const LEVELS = { error:0, warn:1, info:2, debug:3 };
+const LOG_THRESHOLD = LEVELS[LOG_LEVEL] ?? LEVELS.info;
+
 function log(level, msg, extra) {
   const ts = new Date().toISOString();
   const line = `${ts} [${level.toUpperCase()}] ${msg}` + (extra ? " " + JSON.stringify(extra) : "");
-  if (LOG_LEVEL === "debug" || level !== "debug") process.stderr.write(line + "\n");
+  if (LEVELS[level] <= LOG_THRESHOLD) process.stderr.write(line + "\n");
   try {
     if (existsSync(logPath) && readFileSync(logPath, "utf8").length > 10 * 1024 * 1024) {
       try { unlinkSync(logPath + ".1"); } catch {}
@@ -89,11 +97,13 @@ function log(level, msg, extra) {
 }
 
 // ── http helpers ────────────────────────────────────────────────────────
+const keepAliveAgent = new https.Agent({ keepAlive: true });
+
 function httpRequest(method, url, body = null, extraHeaders = {}, timeout = 120000) {
   const u = new URL(url);
   const isHttps = u.protocol === "https:";
   const mod = isHttps ? https : http;
-  const agent = new mod.Agent({ keepAlive: true });
+  const agent = isHttps ? keepAliveAgent : new http.Agent({ keepAlive: true });
 
   const headers = { "Content-Type": "application/json", ...extraHeaders };
   if (body) headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(body), "utf8"));
@@ -386,7 +396,6 @@ async function handleCommand(userId, contextToken, text) {
         const query = parts.slice(1).join(" ").trim();
         if (!query) { await ilinkSendText(userId, "Usage: /search <keyword>", contextToken); return; }
         const sessions = await serveListAllSessions();
-        log("info", "search", { query, sessionCount: sessions.length, sample: sessions.slice(0,2).map(s=>s.title).join("|") });
         const lowerQ = query.toLowerCase();
         const matches = sessions.filter(s => `${s.title} ${s.directory}`.toLowerCase().includes(lowerQ));
         if (matches.length === 0) {
@@ -508,13 +517,19 @@ async function handleMessage(msg) {
   }
 
   try {
+    inflight++;
     await ilinkSendText(userId, "⏳ Processing...", contextToken);
     const result = await serveSendMessage(us.activeSession, text, us.systemPrompt);
     const reply = extractText(result.parts);
     if (reply) {
-      const maxLen = 3500;
-      for (let i = 0; i < reply.length; i += maxLen) {
-        await ilinkSendText(userId, reply.slice(i, i + maxLen), contextToken);
+      const MAX_BYTES = 3500;
+      let pos = 0;
+      while (pos < reply.length) {
+        let end = pos + 1;
+        while (end <= reply.length && Buffer.byteLength(reply.slice(pos, end), "utf8") <= MAX_BYTES) end++;
+        end--;
+        await ilinkSendText(userId, reply.slice(pos, end), contextToken);
+        pos = end;
       }
     } else {
       await ilinkSendText(userId, "✅ Done (no text output).", contextToken);
@@ -522,13 +537,23 @@ async function handleMessage(msg) {
   } catch (e) {
     log("error", "serve msg failed", { error: e.message });
     await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+  } finally {
+    inflight--;
   }
 }
 
 // ── main loop ───────────────────────────────────────────────────────────
 let running = true;
-process.on("SIGINT", () => { running = false; });
-process.on("SIGTERM", () => { running = false; });
+let inflight = 0;
+
+async function shutdown(signal) {
+  running = false;
+  log("info", `shutting down (${signal}), ${inflight} in-flight...`);
+  for (let i = 0; i < 30 && inflight > 0; i++) await sleep(1000);
+  process.exit(0);
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 async function main() {
   log("info", "wx-bridge starting", { ilink_base: ILINK_BASE, serve_url: SERVE_URL, poll_ms: POLL_MS });
