@@ -369,6 +369,7 @@ async function handleCommand(userId, contextToken, text) {
         const query = parts.slice(1).join(" ").trim();
         if (!query) { await ilinkSendText(userId, "Usage: /search <keyword>", contextToken); return; }
         const sessions = await serveListAllSessions();
+        log("info", "search", { query, sessionCount: sessions.length, sample: sessions.slice(0,2).map(s=>s.title).join("|") });
         const lowerQ = query.toLowerCase();
         const matches = sessions.filter(s => `${s.title} ${s.directory}`.toLowerCase().includes(lowerQ));
         if (matches.length === 0) {
@@ -383,6 +384,48 @@ async function handleCommand(userId, contextToken, text) {
         break;
       }
 
+      case "/delete": {
+        const target = parts[1];
+        if (!target) { await ilinkSendText(userId, "Usage: /delete <id> or /delete [N]", contextToken); return; }
+        const sessions = await serveListAllSessions();
+        let session = null;
+        if (target.startsWith("ses_")) session = sessions.find(s => s.id === target);
+        else if (/^\d+$/.test(target)) {
+          const idx = parseInt(target);
+          if (idx >= 0 && idx < sessions.length) session = sessions[idx];
+        }
+        if (!session) { await ilinkSendText(userId, `Session not found: ${target}`, contextToken); return; }
+        try {
+          const sdk = await getSdk();
+          await sdk.session.delete({ sessionID: session.id });
+          if (us.activeSession === session.id) us.activeSession = null;
+          saveState(state);
+          await ilinkSendText(userId, `✅ Deleted: ${session.title}`, contextToken);
+        } catch (e) {
+          await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+        }
+        break;
+      }
+
+      case "/compact": {
+        if (!us.activeSession) { await ilinkSendText(userId, "No active session.", contextToken); return; }
+        try {
+          await ilinkSendText(userId, "⏳ Compacting...", contextToken);
+          const sdk = await getSdk();
+          await sdk.session.abort({ sessionID: us.activeSession });
+          const summary = await serveSendMessage(us.activeSession,
+            "Summarize the current conversation context in one paragraph, preserving all key facts, decisions, and pending tasks.", "");
+          const newSession = await serveCreateSession("(compact) " + (new Date().toLocaleDateString()));
+          us.activeSession = newSession.id;
+          saveState(state);
+          const summaryText = extractText(summary.parts) || "(no summary)";
+          await ilinkSendText(userId, `✅ Compacted.\nNew session: ${newSession.id}\nSummary:\n${summaryText}`, contextToken);
+        } catch (e) {
+          await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+        }
+        break;
+      }
+
       case "/current": {
         await ilinkSendText(userId, `Session: ${us.activeSession || "(none)"}\nModel: ${us.model}`, contextToken);
         break;
@@ -390,7 +433,7 @@ async function handleCommand(userId, contextToken, text) {
 
       case "/help": {
         await ilinkSendText(userId,
-          "🛠 Commands:\n/list — Browse projects/sessions\n/new [title] — Create session\n/resume — List / fuzzy switch\n/stop — Interrupt current task\n/search <word> — Search sessions\n/model [name] — Show/switch model\n/system — Show/set system prompt\n/current — Show current state\n/help — This help",
+          "🛠 Commands:\n/list — Browse projects/sessions\n/new [title] — Create session\n/resume — List / fuzzy switch\n/stop — Interrupt current task\n/search <word> — Search sessions\n/delete <id> — Delete session\n/compact — Compress context to new session\n/model [name] — Show/switch model\n/system — Show/set system prompt\n/current — Show current state\n/help — This help",
           contextToken);
         break;
       }
@@ -458,6 +501,19 @@ process.on("SIGTERM", () => { running = false; });
 
 async function main() {
   log("info", "wx-bridge starting", { ilink_base: ILINK_BASE, serve_url: SERVE_URL, poll_ms: POLL_MS });
+
+  // ── serve heartbeat ──────────────────────────────────────────────────
+  for (let i = 0; i < 10; i++) {
+    try {
+      const sdk = await getSdk();
+      await sdk.global.health();
+      log("info", `serve ready (attempt ${i + 1})`);
+      break;
+    } catch {
+      if (i === 9) { log("error", "serve unreachable after 10 attempts, exiting"); process.exit(1); }
+      await sleep(3000);
+    }
+  }
 
   let buf = "";
   let backoff = 1000;
