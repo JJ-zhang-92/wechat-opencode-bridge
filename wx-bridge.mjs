@@ -536,10 +536,9 @@ async function main() {
   // ── serve heartbeat ──────────────────────────────────────────────────
   for (let i = 0; i < 10; i++) {
     try {
-      const sdk = await getSdk();
-      await sdk.global.health();
-      log("info", `serve ready (attempt ${i + 1})`);
-      break;
+      const resp = await fetch(`${SERVE_URL}/global/health`);
+      if (resp.ok) { log("info", `serve ready (attempt ${i + 1})`); break; }
+      throw new Error(`HTTP ${resp.status}`);
     } catch {
       if (i === 9) { log("error", "serve unreachable after 10 attempts, exiting"); process.exit(1); }
       await sleep(3000);
