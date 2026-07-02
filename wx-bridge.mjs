@@ -5,7 +5,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, statSync } from "fs";
 import { resolve } from "path";
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 import { randomUUID } from "crypto";
 import https from "https";
 import http from "http";
@@ -171,6 +171,14 @@ function findOpenCode() {
   return candidates[0]; // best-effort fallback
 }
 const OCODE = findOpenCode();
+const OCODE_PORT = (() => { try { return new URL(SERVE_URL).port || "4097"; } catch { return "4097"; } })();
+const OCODE_HOST = (() => { try { return new URL(SERVE_URL).hostname || "127.0.0.1"; } catch { return "127.0.0.1"; } })();
+
+// ── NL classifier config ──────────────────────────────────────────────────
+const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
+const NL_CLASSIFY_MODEL = process.env.NL_CLASSIFY_MODEL || "qwen2.5:7b";
+const NL_MODE = process.env.NL_MODE || "auto";
+
 async function serveListAllSessions(limit = 100) {
   try {
     const output = execSync(`"${OCODE}" session list --format json --max-count ${limit}`, {
@@ -197,10 +205,142 @@ async function serveSendMessageAsync(sessionId, text, systemPrompt) {
   if (!resp.ok && resp.status !== 204) throw new Error(`prompt_async HTTP ${resp.status}`);
 }
 
+// ── NL classifier ────────────────────────────────────────────────────────
+let nlActive = false;
+let nlOllamaAvailable = false;
+let nlUserOverride = null;
+
+async function nlDetectOllama() {
+  try {
+    const resp = await fetch(`${OLLAMA_URL}/api/tags`, { signal: AbortSignal.timeout(3000) });
+    return resp.ok;
+  } catch { return false; }
+}
+
+async function ollamaGenerate(prompt) {
+  const resp = await fetch(`${OLLAMA_URL}/api/generate`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: NL_CLASSIFY_MODEL, prompt, stream: false, options: { num_predict: 32, temperature: 0 } }),
+  });
+  if (!resp.ok) throw new Error(`ollama HTTP ${resp.status}`);
+  const data = await resp.json();
+  return (data.response || "").trim();
+}
+
+function updateNlState() {
+  nlActive = nlUserOverride !== null
+    ? nlUserOverride
+    : (NL_MODE === "on" || (NL_MODE === "auto" && nlOllamaAvailable));
+}
+
+async function nlClassifyIntent(text) {
+  const lower = text.toLowerCase();
+  let m;
+
+  // list
+  if (/^(list|列出|查看|显示|看|show)\s*(所有|全部)?\s*(会话|session|projects?|项目)?\s*$/.test(lower))
+    return { intent: "list", args: "" };
+
+  // resume
+  m = lower.match(/^(切换|切换到|进入|回到|打开|switch|resume|用|使用)\s+(.+)/);
+  if (m) return { intent: "resume", args: m[2].trim() };
+  m = lower.match(/^继续\s*(.+)?/);
+  if (m) return { intent: "resume", args: (m[1] || "").trim() };
+
+  // new
+  m = lower.match(/^(新建|创建|建一?个|开始一?个)\s*(会话|session)?\s*(.+)?/);
+  if (m) return { intent: "new", args: (m[3] || "").trim() };
+  m = lower.match(/^(new|create)\s+(.+)/);
+  if (m) return { intent: "new", args: m[2].trim() };
+
+  // stop
+  if (/^(停[止下]|中断|abort|取消任务|别干了|别跑了)\s*$/.test(lower))
+    return { intent: "stop", args: "" };
+
+  // force
+  if (/^(强制|打断|中断并发送|force|强行)\s*$/.test(lower))
+    return { intent: "force", args: "" };
+
+  // confirm
+  if (/^(同意|确认|通过|允许|approve|yes|好|可以|行|ok)\s*$/.test(lower))
+    return { intent: "confirm", args: "" };
+
+  // deny
+  if (/^(拒绝|不同意|deny|no|不许|不行|不可以)\s*$/.test(lower))
+    return { intent: "deny", args: "" };
+
+  // help
+  if (/^(帮助|help|功能|命令|怎么用|usage|使用说明|说明|教程)\s*$/.test(lower))
+    return { intent: "help", args: "" };
+
+  // current
+  if (/^(当前|现在|状态|status|在哪|哪个|信息|info)\s*$/.test(lower))
+    return { intent: "current", args: "" };
+
+  // model
+  m = lower.match(/^(模型|切换模型|model|用哪个模型)\s*(.+)?/);
+  if (m) return { intent: "model", args: (m[2] || "").trim() };
+
+  // search
+  m = lower.match(/^(搜索|查找|search|find|找一[下个])\s+(.+)/);
+  if (m) return { intent: "search", args: m[2].trim() };
+
+  // delete
+  m = lower.match(/^(删除|delete|remove|删掉)\s+(.+)/);
+  if (m) return { intent: "delete", args: m[2].trim() };
+
+  // system
+  m = lower.match(/^(系统提示[词]?|system|设定指令|自定义指令|设指令)\s*(.+)?/);
+  if (m) return { intent: "system", args: (m[2] || "").trim() };
+
+  // compact
+  if (/^(压缩|compact|精简|清上下文|清理上下文|清理)\s*$/.test(lower))
+    return { intent: "compact", args: "" };
+
+  // NL toggle (catch "nl on/off" before LLM)
+  if (/^nl\s*(on|off|开|关)?\s*$/.test(lower)) {
+    m = lower.match(/(on|off|开|关)/);
+    return { intent: "nl", args: m ? (m[1] === "on" || m[1] === "开" ? "on" : "off") : "toggle" };
+  }
+
+  // LLM fallback
+  if (nlActive) {
+    try {
+      const prompt = `Classify intent. Output only JSON, no explanation.
+
+Intents: list, resume, new, stop, force, confirm, deny, search, delete, model, system, current, help, compact, chat.
+
+Examples:
+"show my sessions" → {"intent":"list","args":""}
+"switch to patent" → {"intent":"resume","args":"patent"}
+"new session about Python" → {"intent":"new","args":"Python"}
+"stop it" → {"intent":"stop","args":""}
+"force" → {"intent":"force","args":""}
+"yes" → {"intent":"confirm","args":""}
+"no" → {"intent":"deny","args":""}
+"find chemistry sessions" → {"intent":"search","args":"chemistry"}
+"remove session ABC" → {"intent":"delete","args":"ABC"}
+"what model" → {"intent":"current","args":""}
+"summarize this" → {"intent":"chat","args":""}
+
+Message: "${text}"
+JSON:`;
+      const result = await ollamaGenerate(prompt);
+      const json = JSON.parse(result);
+      if (json.intent && typeof json.intent === "string") return { intent: json.intent, args: json.args || "" };
+    } catch (e) {
+      log("warn", "nl llm classify failed", { error: e.message });
+    }
+  }
+
+  return { intent: "chat", args: "" };
+}
+
 // ── SSE event handling (permissions + async replies) ────────────────────
 const activeTurns = new Map();        // sessionID → { userId, contextToken }
 const pendingPermissions = new Map();  // sessionID → { permissionID, title }
 const turnReplies = new Map();         // sessionID → { text: "" }
+const pendingMessages = new Map();     // sessionID → { userId, contextToken, text }
 
 async function startSSEListener() {
   while (running) {
@@ -253,6 +393,7 @@ function handleSSEEvent(event, data) {
       turnReplies.delete(sid);
       activeTurns.delete(sid);
       pendingPermissions.delete(sid);
+      pendingMessages.delete(sid);
       if (text) {
         const MAX_BYTES = 3500;
         let pos = 0;
@@ -448,6 +589,30 @@ async function handleCommand(userId, contextToken, text) {
         break;
       }
 
+      case "/nl": {
+        if (parts.length < 2) {
+          const mode = nlActive ? "on" : "off";
+          const info = nlOllamaAvailable ? ` (ollama: ${NL_CLASSIFY_MODEL})` : " (ollama unavailable, keywords only)";
+          await ilinkSendText(userId, `NL mode: ${mode}${info}`, contextToken);
+          return;
+        }
+        const arg = parts[1].toLowerCase();
+        if (arg === "on" || arg === "开") {
+          nlUserOverride = true;
+          updateNlState();
+          saveState(state);
+          await ilinkSendText(userId, "✅ NL mode on.", contextToken);
+        } else if (arg === "off" || arg === "关") {
+          nlUserOverride = false;
+          updateNlState();
+          saveState(state);
+          await ilinkSendText(userId, "✅ NL mode off.", contextToken);
+        } else {
+          await ilinkSendText(userId, "Usage: /nl on | /nl off", contextToken);
+        }
+        break;
+      }
+
       case "/system": {
         if (parts.length < 2) {
           await ilinkSendText(userId, `Current system prompt:\n"${us.systemPrompt}"\n\nUsage: /system <new prompt> or /system off`, contextToken);
@@ -477,9 +642,36 @@ async function handleCommand(userId, contextToken, text) {
           activeTurns.delete(us.activeSession);
           pendingPermissions.delete(us.activeSession);
           turnReplies.delete(us.activeSession);
+          pendingMessages.delete(us.activeSession);
           await ilinkSendText(userId, "✅ Interrupt signal sent.", contextToken);
         } catch (e) {
           await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+        }
+        break;
+      }
+
+      case "/force": {
+        if (!us.activeSession) { await ilinkSendText(userId, "No active session.", contextToken); return; }
+        const pending = pendingMessages.get(us.activeSession);
+        if (!pending) { await ilinkSendText(userId, "No pending message. Send a message first when the session is busy.", contextToken); return; }
+        pendingMessages.delete(us.activeSession);
+        try {
+          const sdk = await getSdk();
+          await sdk.session.abort({ sessionID: us.activeSession });
+        } catch { /* ignore abort errors */ }
+        activeTurns.delete(us.activeSession);
+        pendingPermissions.delete(us.activeSession);
+        turnReplies.delete(us.activeSession);
+        try {
+          inflight++;
+          await serveSendMessageAsync(us.activeSession, pending.text, us.systemPrompt);
+          activeTurns.set(us.activeSession, { userId, contextToken });
+          turnReplies.set(us.activeSession, { text: "" });
+          await ilinkSendText(userId, `🔄 Interrupted. Sending: "${pending.text.slice(0, 50)}${pending.text.length > 50 ? "..." : ""}"`, contextToken);
+        } catch (e) {
+          await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+        } finally {
+          inflight--;
         }
         break;
       }
@@ -591,8 +783,9 @@ async function handleCommand(userId, contextToken, text) {
       }
 
       case "/help": {
+        const nlNote = nlActive ? "\n\n💬 NL mode ON — you can use natural language instead of commands." : "";
         await ilinkSendText(userId,
-          "🛠 Commands:\n/list — Browse projects/sessions\n/new [title] — Create session\n/resume — List / fuzzy switch\n/stop — Interrupt current task\n/confirm — Approve permission\n/deny — Deny permission\n/search <word> — Search sessions\n/delete <id> — Delete session\n/compact — Compress context to new session\n/model [name] — Show/switch model\n/system — Show/set system prompt\n/current — Show current state\n/help — This help",
+          "🛠 Commands:\n/list — Browse projects/sessions\n/new [title] — Create session\n/resume — List / fuzzy switch\n/stop — Interrupt current task\n/force — Interrupt & send queued message\n/confirm — Approve permission\n/deny — Deny permission\n/search <word> — Search sessions\n/delete <id> — Delete session\n/compact — Compress context to new session\n/model [name] — Show/switch model\n/system — Show/set system prompt\n/nl [on|off] — Toggle natural language mode\n/current — Show current state\n/help — This help" + nlNote,
           contextToken);
         break;
       }
@@ -639,6 +832,15 @@ async function handleMessage(msg) {
     return;
   }
 
+  // NL classification
+  const { intent, args } = await nlClassifyIntent(text);
+  if (intent !== "chat") {
+    log("info", `nl routed`, { text: text.slice(0, 50), intent, args });
+    const cmdText = `/${intent}${args ? " " + args : ""}`;
+    await handleCommand(userId, contextToken, cmdText);
+    return;
+  }
+
   // Regular message
   if (!us.activeSession) {
     await ilinkSendText(userId, "⚠️ No active session. Use /list && /resume <id> first.", contextToken);
@@ -656,6 +858,13 @@ async function handleMessage(msg) {
     }
     pendingPermissions.delete(us.activeSession);
     await ilinkSendText(userId, `❌ Denied previous request.\nForwarding: "${text.slice(0, 50)}${text.length > 50 ? "..." : ""}"\n\nRe-send your original message to retry.`, contextToken);
+    return;
+  }
+
+  if (activeTurns.has(us.activeSession)) {
+    pendingMessages.set(us.activeSession, { userId, contextToken, text });
+    await ilinkSendText(userId, `⏳ Session is busy. Reply /force to interrupt and send, or wait for the current task to finish.\n\nYour message: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"`, contextToken);
+    return;
   }
 
   try {
@@ -676,8 +885,21 @@ async function handleMessage(msg) {
 let running = true;
 let inflight = 0;
 
+let serveProcess = null;
+
 async function shutdown(signal) {
   running = false;
+  if (serveProcess) {
+    log("info", "stopping opencode serve...");
+    try { serveProcess.kill("SIGTERM"); } catch (e) { log("warn", "serve kill failed", { error: e.message }); }
+    try {
+      await Promise.race([
+        new Promise((r) => { serveProcess.on("exit", r); }),
+        sleep(5000),
+      ]);
+    } catch {}
+    serveProcess = null;
+  }
   log("info", `shutting down (${signal}), ${inflight} in-flight...`);
   for (let i = 0; i < 30 && inflight > 0; i++) await sleep(1000);
   process.exit(0);
@@ -687,6 +909,42 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 async function main() {
   log("info", "wx-bridge starting", { ilink_base: ILINK_BASE, serve_url: SERVE_URL, poll_ms: POLL_MS });
+
+  // ── NL classifier init ─────────────────────────────────────────────────
+  try {
+    nlOllamaAvailable = await nlDetectOllama();
+    updateNlState();
+    log("info", `nl classifier`, { active: nlActive, ollama: nlOllamaAvailable, model: NL_CLASSIFY_MODEL });
+  } catch {
+    log("warn", "nl init failed, classification disabled");
+  }
+
+  // ── opencode serve auto-start ──────────────────────────────────────────
+  let serveAlive = false;
+  try {
+    const resp = await fetch(`${SERVE_URL}/global/health`, { signal: AbortSignal.timeout(3000) });
+    if (resp.ok) serveAlive = true;
+  } catch {}
+
+  if (!serveAlive) {
+    const bin = findOpenCode();
+    if (existsSync(bin)) {
+      log("info", `starting opencode serve on port ${OCODE_PORT}...`);
+      serveProcess = spawn(bin, ["serve", "--port", OCODE_PORT, "--hostname", OCODE_HOST], { stdio: "pipe" });
+      serveProcess.stdout.on("data", (d) => log("debug", "serve", { text: d.toString().trim() }));
+      serveProcess.stderr.on("data", (d) => log("debug", "serve", { text: d.toString().trim() }));
+      serveProcess.on("error", (e) => log("error", "serve spawn error", { error: e.message }));
+      serveProcess.on("exit", (code) => {
+        log("info", `serve exited (code ${code})`);
+        serveProcess = null;
+      });
+      log("info", `spawned opencode serve pid ${serveProcess.pid}`);
+    } else {
+      log("warn", `opencode binary not found at ${bin}, cannot auto-start`);
+    }
+  } else {
+    log("info", "opencode serve already running");
+  }
 
   // ── serve heartbeat ──────────────────────────────────────────────────
   for (let i = 0; i < 10; i++) {
