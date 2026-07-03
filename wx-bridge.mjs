@@ -27,6 +27,20 @@ const ILINK_BASE  = process.env.ILINK_BASE  || "https://ilinkai.weixin.qq.com";
 const SERVE_URL   = process.env.SERVE_URL   || "http://127.0.0.1:4097";
 const POLL_MS     = parseInt(process.env.POLL_MS) || 30000;
 
+function getServePass() {
+  if (process.env.SERVE_PASS) return process.env.SERVE_PASS;
+  if (process.env.OPENCODE_SERVER_PASSWORD) return process.env.OPENCODE_SERVER_PASSWORD;
+  return "";
+}
+const SERVE_PASS = getServePass();
+const SERVE_USER = process.env.SERVE_USER || "opencode";
+
+function serveAuthHeaders() {
+  if (!SERVE_PASS) return {};
+  const pair = `${SERVE_USER}:${SERVE_PASS}`;
+  return { "Authorization": `Basic ${Buffer.from(pair).toString("base64")}` };
+}
+
 function getAllowFrom() {
   if (process.env.WX_ALLOW_FROM) return process.env.WX_ALLOW_FROM;
   try {
@@ -200,7 +214,7 @@ async function serveSendMessageAsync(sessionId, text, systemPrompt) {
   const body = { parts: [{ type: "text", text }] };
   if (systemPrompt) body.system = systemPrompt;
   const resp = await fetch(`${SERVE_URL}/session/${sessionId}/prompt_async`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    method: "POST", headers: { "Content-Type": "application/json", ...serveAuthHeaders() }, body: JSON.stringify(body),
   });
   if (!resp.ok && resp.status !== 204) throw new Error(`prompt_async HTTP ${resp.status}`);
 }
@@ -345,7 +359,7 @@ const pendingMessages = new Map();     // sessionID → { userId, contextToken, 
 async function startSSEListener() {
   while (running) {
     try {
-      const resp = await fetch(`${SERVE_URL}/event`);
+      const resp = await fetch(`${SERVE_URL}/event`, { headers: serveAuthHeaders() });
       if (!resp.ok) throw new Error(`SSE HTTP ${resp.status}`);
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
@@ -922,15 +936,15 @@ async function main() {
   // ── opencode serve auto-start ──────────────────────────────────────────
   let serveAlive = false;
   try {
-    const resp = await fetch(`${SERVE_URL}/global/health`, { signal: AbortSignal.timeout(3000) });
-    if (resp.ok) serveAlive = true;
+    const resp = await fetch(`${SERVE_URL}/global/health`, { headers: serveAuthHeaders(), signal: AbortSignal.timeout(3000) });
+    serveAlive = true; // any HTTP response means serve is listening
   } catch {}
 
   if (!serveAlive) {
     const bin = findOpenCode();
     if (existsSync(bin)) {
       log("info", `starting opencode serve on port ${OCODE_PORT}...`);
-      serveProcess = spawn(bin, ["serve", "--port", OCODE_PORT, "--hostname", OCODE_HOST], { stdio: "pipe" });
+      serveProcess = spawn(bin, ["serve", "--port", OCODE_PORT, "--hostname", OCODE_HOST], { stdio: "pipe", env: process.env });
       serveProcess.stdout.on("data", (d) => log("debug", "serve", { text: d.toString().trim() }));
       serveProcess.stderr.on("data", (d) => log("debug", "serve", { text: d.toString().trim() }));
       serveProcess.on("error", (e) => log("error", "serve spawn error", { error: e.message }));
@@ -949,9 +963,9 @@ async function main() {
   // ── serve heartbeat ──────────────────────────────────────────────────
   for (let i = 0; i < 10; i++) {
     try {
-      const resp = await fetch(`${SERVE_URL}/global/health`, { signal: AbortSignal.timeout(5000) });
-      if (resp.ok) { log("info", `serve ready (attempt ${i + 1})`); break; }
-      throw new Error(`HTTP ${resp.status}`);
+      const resp = await fetch(`${SERVE_URL}/global/health`, { headers: serveAuthHeaders(), signal: AbortSignal.timeout(5000) });
+      log("info", `serve ready (attempt ${i + 1}, status ${resp.status})`);
+      break; // any response = serve is up
     } catch {
       if (i === 9) { log("error", "serve unreachable after 10 attempts, exiting"); try { unlinkSync(PID_FILE); } catch {} process.exit(1); }
       await sleep(3000);
