@@ -1,110 +1,116 @@
 # wechat-opencode-bridge
 
-Control your local [OpenCode](https://github.com/anomalyco/opencode) agent directly from WeChat. Browse, search, and switch sessions across all project directories — with **natural language** commands powered by local LLM.
+Control [OpenCode](https://github.com/anomalyco/opencode) directly from WeChat. Natural language in, natural language out — powered by local LLM (ollama qwen2.5:7b).
 
 ```
-WeChat → ilink API → wx-bridge (Node.js) → OpenCode Serve API → SQLite session DB
-                                     ↕
-                              ollama (local LLM)
+微信 → ilink API → wx-bridge (Node.js) → OpenCode Serve → DeepSeek/V4 API
+                     ↕ ollama qwen2.5:7b
+                  NL routing + output translation
 ```
 
 ## Features
 
-- **Natural language in WeChat** — say "switch to patent" instead of `/resume patent`. Keyword fast-path (<1ms) + ollama LLM fallback (~500ms)
-- **No accidental interrupts** — sending a message while the session is busy queues it; reply `/force` to confirm interruption
-- **Auto-start OpenCode** — bridge spawns `opencode serve` on startup, kills it on shutdown. One command to launch
-- **Full session management** — list all sessions across all directories, fuzzy search by title, create/delete/compact sessions
-- **Custom system prompt** — per-session instructions via `/system`, injected through OpenCode's native `system` parameter
-- **Permission interaction** — `/confirm` / `/deny` for OpenCode permission requests, supports natural language ("agree", "yes")
-- **SSE async replies** — prompt via REST, collect result via Server-Sent Events, supports long-running agent tasks
-- **Long-poll transport** — same ilink bot API used by cc-connect and OpenClaw
+**Bidirectional NL.** Input: keyword regex (<1ms) + LLM context-aware classification (~500ms). Output: regex rules (<1ms) + LLM fallback. Session IDs and slash commands are never shown to the user.
 
-## Prerequisites
+**Auto-start.** One command — `node wx-bridge.mjs`. Bridge spawns OpenCode serve, connects SSE, and begins long-polling WeChat. Ctrl+C kills both.
 
-- **Node.js** 24+
-- **OpenCode CLI** (`npm install -g opencode-ai`)
-- **WeChat ilink bot token** — obtain via [cc-connect](https://github.com/chenhg5/cc-connect) or similar tool
-- **ollama** (optional — for NL classification; keywords work without it)
+**Session index.** 70+ session titles and project directories are pre-built into a static index on startup and injected into every LLM prompt. The LLM always knows which sessions exist.
+
+**Busy protection.** Sending a message while the session is processing won't silently interrupt it. The bridge queues your message and prompts for confirmation.
+
+**Permission risk grading.** Low-risk operations (read, list, show) auto-approve. Critical operations (delete, rm, purge) always prompt. Ambiguous cases go to LLM for judgment.
 
 ## Quick Start
 
 ```bash
-# 1. Set your ilink token
 set ILINK_TOKEN=your-bot-id@im.bot:your-token
-
-# 2. Start the bridge (auto-starts opencode serve if not running)
 node wx-bridge.mjs
 ```
 
-The bridge will:
-1. Detect ollama → enable NL mode
-2. Auto-start `opencode serve --port 4097` if not already running
-3. Wait for serve to be ready
-4. Begin long-polling WeChat messages
-
-Send any message from WeChat to establish the `context_token`. Then you're ready.
+Bridge auto-starts `opencode serve --port 4097`, detects ollama, and begins polling. Send any message from WeChat to establish the `context_token`.
 
 ## Usage
 
-### Natural Language Mode (default when ollama available)
+### Natural language (Phase 1 regex + Phase 2 LLM)
 
-| You say | Does |
-|----------|------|
-| `列出所有会话` | `/list` |
-| `切换专利` | `/resume 专利` |
-| `新建一个会话` | `/new` |
-| `停下` `别跑了` | `/stop` |
-| `强制` | `/force` |
-| `同意` `好的` | `/confirm` |
-| `拒绝` | `/deny` |
-| `搜索 douyin` | `/search douyin` |
-| `什么模型` | `/current` |
-| `帮助` | `/help` |
-| anything else | → sends to active session |
+You don't need to remember commands. Say what you mean:
 
-Toggle with `/nl on` / `/nl off` from WeChat.
+| You say | Bridge does |
+|----------|-------------|
+| `切换专利` `打开 Pt催化实验` | Switch to session by fuzzy title match |
+| `列出` `全部` `看看` | Browse all sessions |
+| `最近` | Recent sessions |
+| `统计` | Session statistics |
+| `停下` `别跑了` `别干了` | Stop current task |
+| `强制` `打断` | Interrupt and send queued message |
+| `同意` `好` `行` | Approve permission |
+| `拒绝` `不行` | Deny permission |
+| `搜索 douyin` | Search sessions |
+| `新建 测试` `建一个 会话` | Create new session |
+| `帮助` | Show help |
+| `状态` `当前` | Show current session |
+| anything else | Forwarded to AI |
 
-### Slash Commands
+### Output — natural language only
 
-| Command | Description |
-|---------|-------------|
-| `/list` | List all sessions across all directories |
-| `/list [N]` | Show sessions in project N |
-| `/list <name>` | Show sessions in matching project |
-| `/resume` | Same as `/list` |
-| `/resume <keyword>` | Fuzzy search and switch — `Pt催化`, `专利`, `douyin` |
-| `/resume [N]` | Switch by list index |
-| `/resume ses_xxx` | Switch by exact session ID |
-| `/new [title]` | Create a new session |
-| `/stop` | Interrupt current task |
-| `/force` | Interrupt current task and send queued message |
-| `/confirm` | Approve pending permission request |
-| `/deny` | Deny pending permission request |
-| `/search <word>` | Search all sessions |
-| `/delete <id>` | Delete session (double-confirm) |
-| `/compact` | Compress context into a new session |
-| `/model` | Show current model |
-| `/model <name>` | Switch model (e.g. `xiaomi/mimo-v2.5`) |
-| `/system` | Show current system prompt |
-| `/system <text>` | Set system prompt |
-| `/system off` | Disable system prompt |
-| `/nl` | Show NL mode status |
-| `/nl on` / `/nl off` | Toggle natural language mode |
-| `/current` | Show current session and model |
-| `/help` | Show all commands |
+All bridge-generated messages are translated. The user never sees session IDs or slash commands:
 
-### Busy Protection
+```
+Before → After
+──────────────────────────────────
+✅ Switched to: 专利 (ses_abc)     →  切换到「专利」了。
+Session: ses_abc\nModel: xxx      →  当前用xxx。
+🔍 3 matches:[0] title (ses_x)    →  找到3个：「title」「title」
+/confirm  /deny                    →  同意还是拒绝？
+```
 
-When the session is processing a task, sending a new message will **not** silently interrupt it. Instead:
+AI replies pass through untouched — the translator only operates on bridge-generated output.
 
-1. Bridge replies: "Session is busy. Reply `/force` to interrupt and send, or wait."
-2. Your message is queued
-3. Reply `/force` → aborts current task → sends your message
-4. Wait for it to finish → queue is auto-cleared, re-send your message
+### Commands (shortcuts)
+
+| Command | Alias | What it does |
+|---------|-------|-------------|
+| `/sessions` | `/s` `/l` `/list` | Browse: summary → filter by project → paginated all |
+| `/recent` | `/r` | Recent sessions; `/r N` to switch |
+| `/stats` | `/st` | Session distribution per project |
+| `/new` | `/n` | Create new session |
+| `/resume` | — | Fuzzy switch by keyword, exact ID, or index |
+| `/stop` | — | Abort current task |
+| `/force` | — | Abort + send queued message |
+| `/confirm` `/deny` | — | Respond to permission prompts |
+| `/search` | — | Full-text search across sessions |
+| `/delete` | `/rm` | Delete session (double-confirm) |
+| `/compact` | — | Compress context into new session |
+| `/model` | — | Show/switch AI model |
+| `/system` | — | Show/set system prompt |
+| `/nl` | — | Toggle natural language mode |
+| `/current` | — | Current session and model |
+| `/help` | — | Show help |
+
+## Architecture
+
+```
+┌──────────┐   ilink long-poll     ┌──────────────────────┐   prompt_async + SSE   ┌──────────┐
+│  WeChat  │ ◄───────────────────► │   wx-bridge.mjs      │ ◄────────────────────► │ OpenCode │
+└──────────┘                       │                      │                        │  Serve   │
+                                   │  ┌────────────────┐  │   /global/event        └──────────┘
+                                   │  │ Input NL Router│  │
+                                   │  │ P1: regex (15) │──┼── ollama qwen2.5:7b
+                                   │  │ P2: LLM + ctx  │  │
+                                   │  └────────────────┘  │
+                                   │                      │
+                                   │  ┌────────────────┐  │
+                                   │  │ Output NL      │  │
+                                   │  │ P1: regex (32) │  │
+                                   │  │ P2: LLM fallbk │  │
+                                   │  └────────────────┘  │
+                                   │                      │   AI replies: pass-through
+                                   └──────────────────────┘
+```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for full data flow.
 
 ## Configuration
-
-All settings via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -113,67 +119,31 @@ All settings via environment variables:
 | `SERVE_URL` | `http://127.0.0.1:4097` | OpenCode serve address |
 | `POLL_MS` | `30000` | Long-poll timeout (ms) |
 | `DATA_DIR` | `~/.cc-connect/wx-bridge` | State and log storage |
-| `LOG_LEVEL` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+| `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `OLLAMA_URL` | `http://localhost:11434` | ollama API address |
-| `NL_CLASSIFY_MODEL` | `qwen2.5:7b` | Model for intent classification |
+| `NL_CLASSIFY_MODEL` | `qwen2.5:7b` | Intent classification model |
 | `NL_MODE` | `auto` | `auto` / `on` / `off` |
-| `OPENCODE_BIN` | *(auto-detected)* | Path to opencode.exe (override auto-detect) |
-| `WX_ALLOW_FROM` | *(none)* | Restrict to a single WeChat user ID |
+| `NL_CONTEXT_ENABLED` | `true` | Set `0` to disable LLM context injection |
+| `PERMISSION_AUTO_APPROVE` | `low` | `off` / `low` / `medium` / `high` |
+| `CAPABILITY_HINT` | *see code* | Injected into LLM context |
+| `OPENCODE_BIN` | *(auto)* | Path to opencode.exe |
+| `WX_ALLOW_FROM` | *(none)* | Restrict to single WeChat user |
 
-## Architecture
+## Testing
 
-See [ARCHITECTURE.md](ARCHITECTURE.md).
-
+```bash
+node test-nl.js        # NL classifier: 33/34 pass
+node test-beg.js       # Commands + translation + permissions: 31/31 pass
+node test-sse-live.js  # Full SSE chain: prompt_async → part → idle
 ```
-┌──────────┐   ilink long-poll   ┌─────────────────┐   prompt_async + SSE   ┌──────────┐
-│  WeChat  │ ◄──────────────────► │  wx-bridge.mjs  │ ◄────────────────────► │ OpenCode │
-└──────────┘                      │                  │                        │  Serve   │
-                                  │  ┌────────────┐ │                        └──────────┘
-                                  │  │ NL Router  │ │                             ▲
-                                  │  │ keywords   │ │                        spawn│serve
-                                  │  │ + LLM      │ │                        ┌──────────┐
-                                  │  └─────┬──────┘ │                        │ opencode │
-                                  │        │ ollama │                        │  CLI     │
-                                  └────────┼────────┘                        └──────────┘
-                                           ▼
-                                   ┌──────────────┐
-                                   │ ollama       │
-                                   │ qwen2.5:7b   │
-                                   └──────────────┘
-```
-
-## Design
-
-Built for **single-user, single-agent** usage. Messages are processed sequentially — one-at-a-time `await` eliminates races, state corruption, and concurrent overload.
-
-- No concurrent message processing
-- No state race conditions
-- No queue or backpressure needed
 
 ## Limitations
 
-- **Personal use only**. Multi-user needs request serialization and state locking.
-- **Windows-only** — opencode.exe path detection uses Windows conventions. macOS/Linux users set `OPENCODE_BIN`.
-- **OpenCode-only** — communicates with OpenCode Serve via SDK + CLI.
-- Session listing blocks the event loop ~1s (execSync). Fine for single-user.
-- NL classification adds ~500ms latency with LLM fallback (keywords are instant).
-
-## FAQ
-
-**Q: First message gets "No active session"?**
-A: Use `/resume <keyword>` or say "切换 <关键词>" in NL mode.
-
-**Q: What does the 412/400 error mean?**
-A: 412 = expired ilink token, re-bind via cc-connect. 400 = don't pass extra fields in the message body.
-
-**Q: How does cross-directory session switching work?**
-A: `opencode session list --format json` returns ALL sessions globally. The bridge lists them all, and OpenCode serve handles cross-directory messages natively.
-
-**Q: Can I use the bridge without ollama?**
-A: Yes. Keyword matching works without ollama. Set `NL_MODE=off` to disable NL entirely, or run `/nl off` from WeChat.
-
-**Q: How do I stop the bridge and OpenCode together?**
-A: `Ctrl+C` in the terminal — the bridge kills the OpenCode serve process before exiting.
+- Personal use only. Single-user, single-agent design.
+- Windows-only. macOS/Linux users set `OPENCODE_BIN`.
+- OpenCode-only. Communicates via SDK + CLI.
+- Session listing blocks event loop ~1s (execSync). Acceptable for single-user.
+- NL LLM adds ~500ms per classification (keyword matches are instant).
 
 ## License
 

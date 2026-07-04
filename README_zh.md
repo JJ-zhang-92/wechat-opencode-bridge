@@ -1,110 +1,116 @@
 # wechat-opencode-bridge
 
-从微信直接操控本地 [OpenCode](https://github.com/anomalyco/opencode) 编程助手。浏览、搜索、切换跨目录的所有 session，支持**自然语言**命令（本地 LLM 驱动）。
+从微信操控 [OpenCode](https://github.com/anomalyco/opencode)。自然语言输入，自然语言输出——本地 LLM（ollama qwen2.5:7b）驱动。
 
 ```
-微信 → ilink API → wx-bridge (Node.js) → OpenCode Serve API → SQLite 会话数据库
-                                     ↕
-                              ollama (本地 LLM)
+微信 → ilink API → wx-bridge (Node.js) → OpenCode Serve → DeepSeek/V4 API
+                     ↕ ollama qwen2.5:7b
+                  NL路由 + 输出翻译
 ```
 
 ## 特性
 
-- **微信自然语言操控** — 说「切换专利」即可，无需记 `/resume 专利`。关键词快匹配 (<1ms) + ollama LLM 兜底 (~500ms)
-- **防误中断** — session 运行中发消息不会静默打断，返回「正忙，回复 /force 确认中断」提示
-- **OpenCode 绑定启动** — bridge 启动时自动 spawn `opencode serve`，退出时自动 kill，一条命令搞定
-- **全量 session 管理** — 列出所有目录的所有 session，模糊搜索切换，创建/删除/compact
-- **自定义 system prompt** — `/system` 设定，经 OpenCode 原生 `system` 参数注入
-- **权限交互** — `/confirm` `/deny` 处理权限请求，自然语言「同意」「拒绝」也支持
-- **SSE 异步回复** — REST 发 prompt + SSE 收结果，支持长任务
-- **长轮询消息** — 与 cc-connect、OpenClaw 同款 ilink bot API
+**双向 NL。** 输入端：关键词正则 (<1ms) + LLM 上下文分类 (~500ms)。输出端：正则替换 (<1ms) + LLM 兜底。用户永远看不到 session ID 和斜杠命令。
 
-## 环境要求
+**一键启动。** `node wx-bridge.mjs`。自动 spawn OpenCode serve、连接 SSE、开始长轮询微信。Ctrl+C 同时关掉 bridge 和 serve。
 
-- **Node.js** 24+
-- **OpenCode CLI** (`npm install -g opencode-ai`)
-- **微信 ilink bot token** — 通过 [cc-connect](https://github.com/chenhg5/cc-connect) 等工具获取
-- **ollama**（可选 — NL 分类用；无 ollama 时关键词匹配仍可用）
+**Session 索引。** 启动时预构建 70+ 个 session 标题和项目目录，注入每次 LLM 调用。LLM 始终知道有哪些会话。
+
+**忙态保护。** Session 正在处理时发消息不会静默中断——bridge 暂存消息并提示确认。
+
+**权限分级。** 低风险（read、list、show）自动通过。危险操作（delete、rm、purge）必须弹窗确认。灰色地带交给 LLM 判断。
 
 ## 快速开始
 
 ```bash
-# 1. 设置 ilink token
 set ILINK_TOKEN=your-bot-id@im.bot:your-token
-
-# 2. 启动桥接（自动启动 opencode serve）
 node wx-bridge.mjs
 ```
 
-Bridge 启动流程：
-1. 检测 ollama → 启用 NL 模式
-2. 如果 opencode serve 未运行则自动 spawn
-3. 等待 serve 就绪
-4. 开始长轮询微信消息
-
-首次使用，先给 Bot 发任意消息以建立 `context_token`。
+Bridge 自动启动 `opencode serve --port 4097`，检测 ollama，开始轮询。首次使用给 Bot 发任意消息建立 `context_token`。
 
 ## 使用方法
 
-### 自然语言模式（检测到 ollama 时默认启用）
+### 自然语言（Phase 1 正则 + Phase 2 LLM）
 
-| 你说 | 相当于 |
-|------|--------|
-| `列出所有会话` | `/list` |
-| `切换专利` | `/resume 专利` |
-| `新建一个会话` | `/new` |
-| `停下` `别跑了` | `/stop` |
-| `强制` `打断` | `/force` |
-| `同意` `好的` `行` | `/confirm` |
-| `拒绝` `不行` | `/deny` |
-| `搜索 douyin` | `/search douyin` |
-| `什么模型` `状态` | `/current` |
-| `帮助` `怎么用` | `/help` |
-| 其他内容 | → 发送给 active session |
+不需要记命令，说人话就行：
 
-微信端 `/nl on` / `/nl off` 随时切换。
-
-### 命令参考
-
-| 命令 | 说明 |
+| 你说 | 桥做 |
 |------|------|
-| `/list` | 列出所有目录的所有 session |
-| `/list [N]` | 查看第 N 个项目中的 session |
-| `/list <名称>` | 查看匹配项目中的 session |
-| `/resume` | 同上 |
-| `/resume <关键词>` | 模糊搜索并切换 — `Pt催化`、`专利`、`douyin` |
-| `/resume [N]` | 按列表序号切换 |
-| `/resume ses_xxx` | 按精确 session ID 切换 |
-| `/new [标题]` | 创建新 session |
-| `/stop` | 中断当前任务 |
-| `/force` | 中断当前任务并发送排队消息 |
-| `/confirm` | 批准权限请求 |
-| `/deny` | 拒绝权限请求 |
-| `/search <词>` | 搜索所有 session |
-| `/delete <id>` | 删除 session（二次确认） |
-| `/compact` | 压缩上下文到新 session |
-| `/model` | 查看当前模型 |
-| `/model <名称>` | 切换模型（如 `xiaomi/mimo-v2.5`） |
-| `/system` | 查看当前 system prompt |
-| `/system <文本>` | 设定 system prompt |
-| `/system off` | 关闭 system prompt |
-| `/nl` | 查看 NL 模式状态 |
-| `/nl on` / `/nl off` | 开关自然语言模式 |
-| `/current` | 查看当前 session 和模型 |
-| `/help` | 显示所有命令 |
+| `切换专利` `打开 Pt催化实验` | 模糊标题匹配切换会话 |
+| `列出` `全部` `看看` | 浏览所有会话 |
+| `最近` | 最近用过的会话 |
+| `统计` | 会话分布统计 |
+| `停下` `别跑了` `别干了` | 中断当前任务 |
+| `强制` `打断` | 中断并发送排队消息 |
+| `同意` `好` `行` | 通过权限请求 |
+| `拒绝` `不行` | 拒绝权限请求 |
+| `搜索 douyin` | 搜索会话 |
+| `新建 测试` `建一个` | 创建新会话 |
+| `帮助` | 显示帮助 |
+| `状态` `当前` | 当前会话和模型 |
+| 其他内容 | 直接发给 AI |
 
-### 忙态保护
+### 输出——纯自然语言
 
-session 正在运行中时，发新消息不会静默打断：
+Bridge 所有输出都经过翻译。用户永远看不到 session ID：
 
-1. Bridge 回复：「⏳ Session 正忙，回复 /force 强制中断并发送，或等待完成」
-2. 你的消息被暂存
-3. 回复 `/force` → 中断当前任务 → 发送你的消息
-4. 等待完成 → 暂存自动清除 → 重新发送你的消息
+```
+翻译前                              → 翻译后
+─────────────────────────────────────────
+✅ Switched to: 专利 (ses_abc)       → 切换到「专利」了。
+Session: ses_abc\nModel: pro         → 当前用pro。
+🔍 3 matches:[0] 标题 (ses_x)        → 找到3个：「标题」「标题」
+/confirm  /deny                       → 同意还是拒绝？
+```
+
+AI 回复直接透传不翻译——翻译器只处理 bridge 自身生成的输出。
+
+### 命令（快捷方式）
+
+| 命令 | 别名 | 作用 |
+|------|------|------|
+| `/sessions` | `/s` `/l` `/list` | 浏览：摘要 → 项目过滤 → 分页 |
+| `/recent` | `/r` | 最近会话；`/r N` 切换 |
+| `/stats` | `/st` | 项目分布 |
+| `/new` | `/n` | 新建会话 |
+| `/resume` | — | 模糊切换：关键词 / 精确ID / 序号 |
+| `/stop` | — | 中断当前任务 |
+| `/force` | — | 中断+发送排队消息 |
+| `/confirm` `/deny` | — | 响应权限弹窗 |
+| `/search` | — | 搜索所有会话 |
+| `/delete` | `/rm` | 删除（二次确认） |
+| `/compact` | — | 压缩上下文到新会话 |
+| `/model` | — | 查看/切换模型 |
+| `/system` | — | 查看/设定系统指令 |
+| `/nl` | — | 切换自然语言模式 |
+| `/current` | — | 当前会话和模型 |
+| `/help` | — | 帮助 |
+
+## 架构
+
+```
+┌──────┐   ilink 长轮询     ┌──────────────────────┐   prompt_async + SSE   ┌──────────┐
+│ 微信 │ ◄────────────────► │   wx-bridge.mjs      │ ◄────────────────────► │ OpenCode │
+└──────┘                     │                      │     /global/event      │  Serve   │
+                             │  ┌────────────────┐  │                        └──────────┘
+                             │  │ 输入端 NL 路由  │  │
+                             │  │ P1: 正则 (15)  │──┼── ollama qwen2.5:7b
+                             │  │ P2: LLM + 上下 │  │
+                             │  └────────────────┘  │
+                             │                      │
+                             │  ┌────────────────┐  │
+                             │  │ 输出端 NL 翻译  │  │
+                             │  │ P1: 正则 (32)  │  │
+                             │  │ P2: LLM 兜底   │  │
+                             │  └────────────────┘  │
+                             │                      │   AI 回复：直接透传
+                             └──────────────────────┘
+```
+
+详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 配置
-
-所有设置通过环境变量：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
@@ -112,68 +118,32 @@ session 正在运行中时，发新消息不会静默打断：
 | `ILINK_BASE` | `https://ilinkai.weixin.qq.com` | ilink API 地址 |
 | `SERVE_URL` | `http://127.0.0.1:4097` | OpenCode serve 地址 |
 | `POLL_MS` | `30000` | 长轮询超时（毫秒） |
-| `DATA_DIR` | `~/.cc-connect/wx-bridge` | 状态和日志存储路径 |
-| `LOG_LEVEL` | `info` | 日志级别 (`debug`/`info`/`warn`/`error`) |
-| `OLLAMA_URL` | `http://localhost:11434` | ollama API 地址 |
+| `DATA_DIR` | `~/.cc-connect/wx-bridge` | 状态和日志路径 |
+| `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `OLLAMA_URL` | `http://localhost:11434` | ollama 地址 |
 | `NL_CLASSIFY_MODEL` | `qwen2.5:7b` | 意图分类模型 |
 | `NL_MODE` | `auto` | `auto` / `on` / `off` |
-| `OPENCODE_BIN` | *(自动检测)* | opencode.exe 路径（覆盖自动检测） |
-| `WX_ALLOW_FROM` | *(无)* | 限制为单个微信用户 |
+| `NL_CONTEXT_ENABLED` | `true` | 设为 `0` 关闭 LLM 上下文 |
+| `PERMISSION_AUTO_APPROVE` | `low` | `off` / `low` / `medium` / `high` |
+| `CAPABILITY_HINT` | *见代码* | 注入 LLM 上下文的能力提示 |
+| `OPENCODE_BIN` | *(自动)* | opencode.exe 路径 |
+| `WX_ALLOW_FROM` | *(无)* | 限制单个微信用户 |
 
-## 架构
+## 测试
 
-详见 [ARCHITECTURE.md](ARCHITECTURE.md)。
-
+```bash
+node test-nl.js        # NL 分类器: 33/34 pass
+node test-beg.js       # 命令 + 翻译 + 权限: 31/31 pass
+node test-sse-live.js  # SSE 全链路: prompt_async → part → idle
 ```
-┌──────┐   ilink 长轮询     ┌─────────────────┐   prompt_async + SSE   ┌──────────┐
-│ 微信 │ ◄────────────────► │  wx-bridge.mjs  │ ◄────────────────────► │ OpenCode │
-└──────┘                     │                  │                        │  Serve   │
-                             │  ┌────────────┐ │                        └──────────┘
-                             │  │ NL 路由器   │ │                             ▲
-                             │  │ 关键词匹配  │ │                        spawn│serve
-                             │  │ + LLM 分类 │ │                        ┌──────────┐
-                             │  └─────┬──────┘ │                        │ opencode │
-                             │        │ ollama │                        │  CLI     │
-                             └────────┼────────┘                        └──────────┘
-                                      ▼
-                              ┌──────────────┐
-                              │ ollama       │
-                              │ qwen2.5:7b   │
-                              └──────────────┘
-```
-
-## 设计理念
-
-为**单人、单 Agent** 设计。消息串行处理，`await` 天然消除竞争、状态损坏和并发过载。
-
-- 消息串行 — 同一时间只有一条消息在执行
-- 无状态竞争 — 状态更新在同步执行流中完成
-- 无需限流 — 单人使用无法过载
 
 ## 使用限制
 
-- **个人使用** — 多用户需加请求串行化和状态锁
-- **仅支持 Windows** — opencode.exe 路径检测使用 Windows 规范。macOS/Linux 需设置 `OPENCODE_BIN`
-- **仅支持 OpenCode** — 通过 SDK + CLI 与 OpenCode Serve 通信
-- session 列表使用 `execSync`，会阻塞 event loop 约 1 秒（单人可接受）
-- NL LLM 分类增加约 500ms 延迟（关键词匹配即时）
-
-## 常见问题
-
-**Q: 首次发消息提示 "No active session"？**
-A: 用 `/resume <关键词>` 或在 NL 模式下说「切换 <关键词>」。
-
-**Q: 412/400 错误是什么？**
-A: 412 = ilink token 过期，通过 cc-connect 重新绑定。400 = 请求体中传了多余字段。
-
-**Q: 跨目录 session 切换如何实现？**
-A: `opencode session list --format json` 返回全局 session。Bridge 列出全部后，OpenCode serve 原生支持跨目录消息发送。
-
-**Q: 不用 ollama 能用吗？**
-A: 能。关键词匹配不依赖 ollama。设 `NL_MODE=off` 完全关闭 NL，或微信端 `/nl off`。
-
-**Q: 如何一起关闭 bridge 和 OpenCode？**
-A: 终端 `Ctrl+C` — bridge 退出前自动 kill OpenCode serve。
+- 个人使用。单人单 Agent 设计。
+- 仅 Windows。macOS/Linux 需设 `OPENCODE_BIN`。
+- 仅 OpenCode。通过 SDK + CLI 通信。
+- Session 列表用 execSync，阻塞约 1 秒（单人可接受）。
+- NL LLM 分类增加约 500ms（关键词匹配即时）。
 
 ## License
 
