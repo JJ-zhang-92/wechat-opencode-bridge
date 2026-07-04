@@ -192,6 +192,39 @@ const OCODE_HOST = (() => { try { return new URL(SERVE_URL).hostname || "127.0.0
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
 const NL_CLASSIFY_MODEL = process.env.NL_CLASSIFY_MODEL || "qwen2.5:7b";
 const NL_MODE = process.env.NL_MODE || "auto";
+const NL_CONTEXT_ENABLED = process.env.NL_CONTEXT_ENABLED !== "0";
+const CAPABILITY_HINT = process.env.CAPABILITY_HINT || "legal search, bid generation, patent drafting, doc processing, image generation, database query";
+const PERMISSION_AUTO_APPROVE = process.env.PERMISSION_AUTO_APPROVE || "low";
+
+let cachedSessions = [];
+let cachedSessionsAt = 0;
+let sessionIndex = "";
+
+function buildSessionIndex(sessions) {
+  const parts = [];
+  const dirs = [...new Set(sessions.map(s => s.directory).filter(Boolean))];
+  if (dirs.length) {
+    parts.push(`Projects: ${dirs.map(d => d.split(/[\/\\]/).filter(Boolean).pop() || "?").join(", ")}`);
+  }
+  const titles = sessions.map(s => `[${s.title}]`).join(", ");
+  if (titles.length > 400) {
+    parts.push(`Titles: ${titles.slice(0, 400)}...`);
+  } else if (titles) {
+    parts.push(`Titles: ${titles}`);
+  }
+  return parts.length ? `[INDEX]\n${parts.join("\n")}\n---\n` : "";
+}
+
+async function getSessions(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && cachedSessions.length > 0 && (now - cachedSessionsAt) < 30_000) {
+    return cachedSessions;
+  }
+  cachedSessions = await serveListAllSessions();
+  cachedSessionsAt = now;
+  sessionIndex = buildSessionIndex(cachedSessions);
+  return cachedSessions;
+}
 
 async function serveListAllSessions(limit = 100) {
   try {
@@ -247,33 +280,74 @@ function updateNlState() {
     : (NL_MODE === "on" || (NL_MODE === "auto" && nlOllamaAvailable));
 }
 
-async function nlClassifyIntent(text) {
+function buildContext(us, sessions) {
+  try {
+    let parts = [];
+    if (us.activeSession) {
+      const cur = sessions.find(s => s.id === us.activeSession);
+      if (cur) {
+        const dir = (cur.directory || "").split(/[\/\\]/).filter(Boolean).pop() || "?";
+        parts.push(`Active: ${cur.title} (${dir})`);
+      }
+    }
+    const recent = (us._recent || []).slice(0, 8);
+    if (recent.length) {
+      parts.push(`Recent: ${recent.map(s => `[${s.title}] (${(s.directory || "").split(/[\/\\]/).filter(Boolean).pop() || "?"})`).join(", ")}`);
+    }
+    const dynamic = parts.length ? `[CONTEXT]\n${parts.join("\n")}\nMain: ${CAPABILITY_HINT}\n` : "";
+    return sessionIndex + dynamic + "---\n";
+  } catch { return sessionIndex + "---\n"; }
+}
+
+async function nlClassifyIntent(text, us, sessions) {
   const lower = text.toLowerCase();
+
+  // gate: multi-line and URLs don't need LLM
+  if (lower.includes("\n")) return { intent: "chat", args: "" };
+  if (/^https?:\/\//i.test(lower)) return { intent: "chat", args: "" };
+
+  // ── Phase 1: high-precision keyword matching (optimization only) ──────
   let m;
 
-  // list
-  if (/^(list|列出|查看|显示|看|show)\s*(所有|全部)?\s*(会话|session|projects?|项目)?\s*$/.test(lower))
-    return { intent: "list", args: "" };
-
-  // resume
-  m = lower.match(/^(切换|切换到|进入|回到|打开|switch|resume|用|使用)\s+(.+)/);
+  // resume: must have explicit subject after the verb
+  m = lower.match(/^(切换|切换到|进入|回到|打开|switch|resume|继续)\s+(\S.{1,60}?)$/);
   if (m) return { intent: "resume", args: m[2].trim() };
-  m = lower.match(/^继续\s*(.+)?/);
-  if (m) return { intent: "resume", args: (m[1] || "").trim() };
+
+  // exact title match → resume (user typed the session name)
+  const titleMatch = sessions.find(s => (s.title || "").toLowerCase() === lower);
+  if (titleMatch) return { intent: "resume", args: titleMatch.title };
+
+  // sessions
+  if (/^(列出|查看|看|显示|show|看看|全部|所有|list|sessions?)\s*$/.test(lower))
+    return { intent: "sessions", args: "" };
+  m = lower.match(/^(list|sessions?|列出|查看|看)\s+(\S.+)/);
+  if (m) return { intent: "sessions", args: m[2].trim() };
+
+  // recent
+  if (/^(最近|recent|latest|刚才)\s*$/.test(lower)) return { intent: "recent", args: "" };
+
+  // stats
+  if (/^(统计|stats?)\s*$/.test(lower)) return { intent: "stats", args: "" };
 
   // new
-  m = lower.match(/^(新建|创建|建一?个|开始一?个)\s*(会话|session)?\s*(.+)?/);
-  if (m) return { intent: "new", args: (m[3] || "").trim() };
-  m = lower.match(/^(new|create)\s+(.+)/);
-  if (m) return { intent: "new", args: m[2].trim() };
+  m = lower.match(/^(新建|创建|建|new)\s*(.+)?/);
+  if (m) return { intent: "new", args: (m[2] || "").trim() };
 
-  // stop
-  if (/^(停[止下]|中断|abort|取消任务|别干了|别跑了)\s*$/.test(lower))
-    return { intent: "stop", args: "" };
+  // search
+  m = lower.match(/^(搜索|查找|search|find|找)\s+(\S.+)/);
+  if (m) return { intent: "search", args: m[2].trim() };
 
-  // force
-  if (/^(强制|打断|中断并发送|force|强行)\s*$/.test(lower))
-    return { intent: "force", args: "" };
+  // delete
+  m = lower.match(/^(删除|delete|remove|删)\s+(\S.+)/);
+  if (m) return { intent: "delete", args: m[2].trim() };
+
+  // model
+  m = lower.match(/^(模型|model)\s*(.+)?/);
+  if (m) return { intent: "model", args: (m[2] || "").trim() };
+
+  // system
+  m = lower.match(/^(系统|设定指令|system)\s*(.+)?/);
+  if (m) return { intent: "system", args: (m[2] || "").trim() };
 
   // confirm
   if (/^(同意|确认|通过|允许|approve|yes|好|可以|行|ok)\s*$/.test(lower))
@@ -283,64 +357,61 @@ async function nlClassifyIntent(text) {
   if (/^(拒绝|不同意|deny|no|不许|不行|不可以)\s*$/.test(lower))
     return { intent: "deny", args: "" };
 
+  // stop
+  if (/^(停[止下]|中断|abort|取消)\b/.test(lower) || /^(别)(跑|干|搞|弄)/.test(lower))
+    return { intent: "stop", args: "" };
+
+  // force
+  if (/^(强制|打断|force|强行)\s*$/.test(lower))
+    return { intent: "force", args: "" };
+
   // help
-  if (/^(帮助|help|功能|命令|怎么用|usage|使用说明|说明|教程)\s*$/.test(lower))
+  if (/^(帮助|help|功能|命令|怎么|说明|教程)\s*$/.test(lower))
     return { intent: "help", args: "" };
 
   // current
-  if (/^(当前|现在|状态|status|在哪|哪个|信息|info)\s*$/.test(lower))
+  if (/^(当前|状态|status|在哪|哪个)\s*$/.test(lower))
     return { intent: "current", args: "" };
 
-  // model
-  m = lower.match(/^(模型|切换模型|model|用哪个模型)\s*(.+)?/);
-  if (m) return { intent: "model", args: (m[2] || "").trim() };
-
-  // search
-  m = lower.match(/^(搜索|查找|search|find|找一[下个])\s+(.+)/);
-  if (m) return { intent: "search", args: m[2].trim() };
-
-  // delete
-  m = lower.match(/^(删除|delete|remove|删掉)\s+(.+)/);
-  if (m) return { intent: "delete", args: m[2].trim() };
-
-  // system
-  m = lower.match(/^(系统提示[词]?|system|设定指令|自定义指令|设指令)\s*(.+)?/);
-  if (m) return { intent: "system", args: (m[2] || "").trim() };
-
   // compact
-  if (/^(压缩|compact|精简|清上下文|清理上下文|清理)\s*$/.test(lower))
+  if (/^(压缩|compact|精简|清理)\s*$/.test(lower))
     return { intent: "compact", args: "" };
 
-  // NL toggle (catch "nl on/off" before LLM)
+  // nl toggle
   if (/^nl\s*(on|off|开|关)?\s*$/.test(lower)) {
-    m = lower.match(/(on|off|开|关)/);
-    return { intent: "nl", args: m ? (m[1] === "on" || m[1] === "开" ? "on" : "off") : "toggle" };
+    const toggle = lower.match(/(on|off|开|关)/);
+    return { intent: "nl", args: toggle ? (toggle[1] === "on" || toggle[1] === "开" ? "on" : "off") : "toggle" };
   }
 
-  // LLM fallback
+  // ── Phase 2: LLM with context + confidence ────────────────────────────
   if (nlActive) {
     try {
-      const prompt = `Classify intent. Output only JSON, no explanation.
+      const ctx = NL_CONTEXT_ENABLED ? buildContext(us, sessions) : "";
+      const prompt = ctx + `Classify intent. Output only JSON: {"intent":"<cmd>","args":"<arg>","confidence":<0-1>}
 
-Intents: list, resume, new, stop, force, confirm, deny, search, delete, model, system, current, help, compact, chat.
+Intents: chat, sessions, recent, stats, resume, new, stop, force, confirm, deny, search, delete, model, system, current, help, compact
+
+Rules:
+- If text looks like conversation, not a command → chat with high confidence
+- confidence < 0.6 → return "chat"
+- Use exact session titles from context when matching
+- Short imperative text may be a command; long descriptive text is chat
 
 Examples:
-"show my sessions" → {"intent":"list","args":""}
-"switch to patent" → {"intent":"resume","args":"patent"}
-"new session about Python" → {"intent":"new","args":"Python"}
-"stop it" → {"intent":"stop","args":""}
-"force" → {"intent":"force","args":""}
-"yes" → {"intent":"confirm","args":""}
-"no" → {"intent":"deny","args":""}
-"find chemistry sessions" → {"intent":"search","args":"chemistry"}
-"remove session ABC" → {"intent":"delete","args":"ABC"}
-"what model" → {"intent":"current","args":""}
-"summarize this" → {"intent":"chat","args":""}
+"how does this work" → {"intent":"chat","args":"","confidence":0.95}
+"tell me about it" → {"intent":"chat","args":"","confidence":0.95}
+"show all sessions" → {"intent":"sessions","args":"all","confidence":0.95}
+"switch to patent" → {"intent":"resume","args":"patent","confidence":0.95}
+"stop" → {"intent":"stop","args":"","confidence":0.95}
+"yes" → {"intent":"confirm","args":"","confidence":0.9}
 
 Message: "${text}"
 JSON:`;
       const result = await ollamaGenerate(prompt);
       const json = JSON.parse(result);
+      if (json.intent === "chat" || (json.confidence || 0) < 0.6) {
+        return { intent: "chat", args: "" };
+      }
       if (json.intent && typeof json.intent === "string") return { intent: json.intent, args: json.args || "" };
     } catch (e) {
       log("warn", "nl llm classify failed", { error: e.message });
@@ -348,6 +419,38 @@ JSON:`;
   }
 
   return { intent: "chat", args: "" };
+}
+
+// ── permission risk assessment ─────────────────────────────────────────
+function assessRiskByRule(title, type) {
+  const t = (title + " " + (type || "")).toLowerCase();
+  if (/^(read|list|ls|cat|grep|show|get|find|count|stat|ps|df|du|pwd|whoami|hostname)\b/.test(t) &&
+      !/delete|rm|mv|kill|write|save|create/i.test(t)) return "low";
+  if (/\b(delete|remove|rm|purge|drop|truncate)\b/i.test(t)) return "critical";
+  if (/\b(write|save|create|mv|copy|install|paste|replace|append)\b/i.test(t)) return "high";
+  if (/\b(network|fetch|http|curl|api)\b/i.test(t)) return "medium";
+  return "unknown";
+}
+
+async function assessRiskByLLM(title, type) {
+  try {
+    const prompt = `Classify the risk level of this operation. Output only JSON: {"risk":"low|medium|high|critical","reason":"..."}
+
+Operation title: "${title}"
+Operation type: "${type || ''}"
+
+Risk levels:
+- low: read-only, no side effects (list, show, get, view, ls, cat, grep, stat)
+- medium: network access or ambiguous commands
+- high: file write, modify, or create
+- critical: delete, remove, purge, or destructive operations
+
+JSON:`;
+    const result = await ollamaGenerate(prompt);
+    const json = JSON.parse(result);
+    if (json.risk) return json.risk;
+  } catch (e) { /* fall through */ }
+  return "medium";
 }
 
 // ── SSE event handling (permissions + async replies) ────────────────────
@@ -359,20 +462,40 @@ const pendingMessages = new Map();     // sessionID → { userId, contextToken, 
 async function startSSEListener() {
   while (running) {
     try {
-      const resp = await fetch(`${SERVE_URL}/event`, { headers: serveAuthHeaders() });
+      const resp = await fetch(`${SERVE_URL}/global/event`, { headers: serveAuthHeaders() });
       if (!resp.ok) throw new Error(`SSE HTTP ${resp.status}`);
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
-      let buf = "", currentEvent = "";
+      let buf = "";
       while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split("\n"); buf = lines.pop() || "";
-        for (const line of lines) {
-          if (line.startsWith("event: ")) { currentEvent = line.slice(7).trim(); continue; }
-          if (!line.startsWith("data: ")) continue;
-          try { handleSSEEvent(currentEvent, JSON.parse(line.slice(6))); } catch {}
+        const result = await Promise.race([
+          reader.read(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("sse idle timeout")), 120_000)),
+        ]);
+        if (result.done) break;
+        buf += decoder.decode(result.value, { stream: true });
+        // /global/event sends SSE with \n\n delimiters
+        buf = buf.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        const chunks = buf.split("\n\n");
+        buf = chunks.pop() || "";
+        for (const chunk of chunks) {
+          if (!chunk.trim()) continue;
+          let eventType = "message";
+          let data = "";
+          for (const line of chunk.split("\n")) {
+            if (line.startsWith("event:")) eventType = line.slice(6).trim();
+            else if (line.startsWith("data:")) data += line.slice(5).trim();
+          }
+          if (!data) continue;
+          try {
+            const raw = JSON.parse(data);
+            // Unwrap /global/event envelope → extract payload
+            const pt = raw.payload?.type || eventType;
+            const props = raw.payload?.properties || raw;
+            const sid = props.sessionID || raw.sessionID || "";
+            log("debug", `sse ${pt}`, { sid: sid.slice(0, 20) });
+            await handleSSEEvent(pt, { sessionID: sid, ...props });
+          } catch {}
         }
       }
     } catch (e) { log("warn", "SSE error", { error: e.message }); }
@@ -380,30 +503,61 @@ async function startSSEListener() {
   }
 }
 
-function handleSSEEvent(event, data) {
+async function handleSSEEvent(event, data) {
   const sid = data.sessionID;
   switch (event) {
     case "permission.asked": {
       const turn = activeTurns.get(sid);
       if (!turn) return;
-      const pt = { permissionID: data.id, title: data.title || data.type || "Permission" };
+      const title = data.title || data.type || "Permission";
+      const ruleRisk = assessRiskByRule(data.title, data.type);
+
+      if (ruleRisk === "low") {
+        try {
+          const sdk = await getSdk();
+          await sdk.permission.respond({ sessionID: sid, permissionID: data.id, response: "once" });
+        } catch { /* ok, permission may have been answered elsewhere */ }
+        return;
+      }
+
+      let risk = ruleRisk;
+      if (risk === "unknown" && nlActive) {
+        risk = await assessRiskByLLM(data.title, data.type);
+      }
+
+      const allowUpTo = { low: 1, medium: 2, high: 3, off: 0 }[PERMISSION_AUTO_APPROVE] ?? 1;
+      const riskLevel = { low: 1, medium: 2, high: 3, critical: 4 }[risk] ?? 2;
+      if (riskLevel <= allowUpTo) {
+        try {
+          const sdk = await getSdk();
+          await sdk.permission.respond({ sessionID: sid, permissionID: data.id, response: "once" });
+        } catch {}
+        return;
+      }
+
+      const pt = { permissionID: data.id, title };
       pendingPermissions.set(sid, pt);
-      ilinkSendText(turn.userId, `🔐 [${pt.title}]\n/confirm  /deny   or ask questions`, turn.contextToken).catch(()=>{});
+      sendToWeChat(turn.userId, `🔐 [${pt.title}]\n/confirm  /deny   or ask questions`, turn.contextToken).catch(()=>{});
       break;
     }
     case "message.part.updated": {
       if (!data.part || data.part.type !== "text") return;
-      if (!activeTurns.has(sid)) return;
+      if (!activeTurns.has(sid)) {
+        log("warn", "part no turn — dropped", { sid: sid.slice(0, 20), chars: (data.part.text || "").length });
+        return;
+      }
       const r = turnReplies.get(sid) || { text: "" };
       r.text += (data.part.text || "");
       turnReplies.set(sid, r);
       break;
     }
     case "session.idle": {
+      log("debug", "idle", { sid: sid.slice(0, 20), hasTurn: activeTurns.has(sid) });
       const turn = activeTurns.get(sid);
-      if (!turn) return;
+      if (!turn) { log("warn", "idle no turn — response dropped", { sid: sid.slice(0, 20) }); return; }
       const reply = turnReplies.get(sid);
       const text = reply?.text || "";
+      log("debug", "idle reply", { sid: sid.slice(0, 20), chars: text.length });
       turnReplies.delete(sid);
       activeTurns.delete(sid);
       pendingPermissions.delete(sid);
@@ -411,14 +565,18 @@ function handleSSEEvent(event, data) {
       if (text) {
         const MAX_BYTES = 3500;
         let pos = 0;
+        let chunkN = 0;
         while (pos < text.length) {
           let end = pos + 1;
           while (end <= text.length && Buffer.byteLength(text.slice(pos, end), "utf8") <= MAX_BYTES) end++;
           end--;
-          ilinkSendText(turn.userId, text.slice(pos, end), turn.contextToken).catch(()=>{});
+          log("debug", `idle send chunk ${chunkN}`, { sid: sid.slice(0, 20), bytes: Buffer.byteLength(text.slice(pos, end), "utf8") });
+          ilinkSendText(turn.userId, text.slice(pos, end), turn.contextToken).catch(e => log("warn", "idle send fail", { sid: sid.slice(0, 20), error: e.message }));
           pos = end;
+          chunkN++;
         }
       } else {
+        log("debug", "idle done (empty)", { sid: sid.slice(0, 20) });
         ilinkSendText(turn.userId, "✅ Done (no text output).", turn.contextToken).catch(()=>{});
       }
       break;
@@ -477,45 +635,258 @@ function getUserState(userId) {
   return state.users[userId];
 }
 
+function recordResume(userId, session) {
+  const us = getUserState(userId);
+  if (!us._recent) us._recent = [];
+  us._recent = us._recent.filter(s => s.id !== session.id);
+  us._recent.unshift({ id: session.id, title: session.title || "", directory: session.directory || "", ts: new Date().toISOString() });
+  if (us._recent.length > 20) us._recent = us._recent.slice(0, 20);
+  saveState(state);
+}
+
+// ── output NL translator ────────────────────────────────────────────────
+function translateOutput(text) {
+  let t = text;
+
+  // Switch: "✅ Switched to: title (ses_xxx)" → "切换到「title」了。"
+  t = t.replace(/✅ Switched to: (.+?) \(ses_\S+\)/g, '切换到「$1」了。');
+
+  // New: "✅ Created: ses_xxx\nTitle: title"
+  t = t.replace(/✅ Created: ses_\S+\nTitle: (.+)/g, '新建了「$1」。');
+
+  // Delete: "✅ Deleted: title" → "删掉了「title」。"
+  t = t.replace(/✅ Deleted: (.+)/g, '删掉了「$1」。');
+
+  // Delete confirm: "⚠️ Confirm delete: title (ses_xxx)\nReply..."
+  t = t.replace(/⚠️ Confirm delete: (.+?) \(ses_\S+\)\nReply .+/g, '确认删除「$1」？再说一次。');
+
+  // Compact: "✅ Compacted." header
+  t = t.replace(/✅ Compacted\./g, '压缩好了。');
+  t = t.replace(/New session: ses_\S+/g, '');
+
+  // Match lines: "[N] title (ses_xxx)" or "[N] title @dir"
+  t = t.replace(/\[\d+\] (.+?) \(ses_\S+\)/g, '「$1」');
+  t = t.replace(/\s+\[\d+\] (.+?) @\S+/g, '「$1」');
+
+  // Match headers: "🔍 N matches" / "🔍 No exact match"
+  t = t.replace(/🔍 (\d+) matches[^:]*:\n/g, '找到$1个：');
+  t = t.replace(/🔍 No exact match for "(.+?)"\. Closest:\n/g, '没完全匹配「$1」。相近的有：');
+
+  // Recent: "📌 Recent:\n" keep
+  t = t.replace(/→ \/r N 切换\s*\|?\s*\/?resume?.*/g, '');
+  t = t.replace(/→ \/s all \d+ 下一页/g, '');
+  t = t.replace(/→ \/s all 全部\s*\|?\s*\/r 切换/g, '');
+
+  // No session found
+  t = t.replace(/❌ No session found\. \/s to browse, \/r for recent\./g, '没找到。说「列出」看全部。');
+  t = t.replace(/❌ No session matching "(.+?)"\. .+/g, '没找到「$1」。输短关键词试试。');
+  t = t.replace(/❌ Session .+ not found/g, '没找到那个会话。');
+
+  // Index out of range: "❌ Index N out of range (0-M)"
+  t = t.replace(/❌ Index (\d+) out of range \((\d+)-(\d+)\)/g, '编号不对，在$2到$3之间。');
+  t = t.replace(/❌ Project index .+/g, '');
+
+  // Current: "Session: ses_xxx\nModel: xxx" or "Session: (none)\nModel: xxx"
+  t = t.replace(/Session: ses_\S+\nModel: (.+)/g, '当前用$1。');
+  t = t.replace(/Session: \(none\)\nModel: (.+)/g, '还没选会话。当前用$1。');
+
+  // Stats: "📊 N total · M projects · K active"
+  t = t.replace(/📊 (\d+) total · (\d+) projects · (\d+) active/g, '共$1个会话、$2个项目、本周活跃$3个。');
+
+  // Sessions summary: "📊 N sessions · M projects"
+  t = t.replace(/📊 (\d+) sessions · (\d+) projects/g, '$1个会话、$2个项目。');
+
+  // CLI hints cleanup
+  t = t.replace(/Reply with "\/resume \[N\]"/g, '');
+  t = t.replace(/Reply with number[^.]+\./g, '');
+  t = t.replace(/Narrow your search\n?/g, '');
+  t = t.replace(/Try a shorter keyword like (.+) to switch\./g, '说「切换 $1」试试。');
+
+  // Trailing hints
+  t = t.replace(/\n→ .+/g, '');
+  t = t.replace(/→ $/g, '');
+  t = t.replace(/\nUsage: .+/g, '');
+  t = t.replace(/Available: .+/g, '');
+
+  // Permission prompt: "/confirm /deny or ask questions"
+  t = t.replace(/\/confirm\s*\/deny\s*or ask questions/g, '同意还是拒绝？');
+
+  // Empty lines compact
+  t = t.replace(/\n{3,}/g, '\n\n');
+
+  // Clean trailing whitespace
+  if (t !== text) return t.trim();
+  return null;
+}
+
+async function sendToWeChat(userId, text, contextToken) {
+  // Phase 1: regex translation
+  const nl = translateOutput(text);
+  if (nl) return ilinkSendText(userId, nl, contextToken);
+
+  // Phase 2: LLM translation
+  if (nlActive && /[🔍✅❌⚠️📊📌📋🕐📁🛠]/.test(text)) {
+    try {
+      const result = await ollamaGenerate(
+        `Convert to natural Chinese for WeChat. Remove session IDs, slash commands, CLI formatting. Keep ≤150 chars.\nInput: "${text}"\nOutput:`
+      );
+      return ilinkSendText(userId, result.trim(), contextToken);
+    } catch {}
+  }
+
+  // Pass through (already NL, or LLM unavailable)
+  return ilinkSendText(userId, text, contextToken);
+}
+
 // ── command router ──────────────────────────────────────────────────────
 async function handleCommand(userId, contextToken, text) {
   const us = getUserState(userId);
   const parts = text.trim().split(/\s+/);
-  const cmd = parts[0].toLowerCase();
+  let cmd = parts[0].toLowerCase();
+
+  // alias resolution
+  if (cmd === "/s") cmd = "/sessions";
+  else if (cmd === "/st") cmd = "/stats";
+  else if (cmd === "/n") cmd = "/new";
+  else if (cmd === "/rm") cmd = "/delete";
+  else if (cmd === "/l" || cmd === "/list") cmd = "/sessions";
+  else if (cmd === "/r") {
+    if (parts.length === 1) cmd = "/recent";
+    else if (/^\d+$/.test(parts[1])) cmd = "/recent";
+    else cmd = "/resume";
+  }
 
   try {
     switch (cmd) {
-      case "/list": {
+      case "/sessions": {
         const sessions = await serveListAllSessions();
         if (sessions.length === 0) {
-          await ilinkSendText(userId, "No sessions found.", contextToken);
+          await sendToWeChat(userId, "No sessions.", contextToken);
           return;
         }
         const { groups, order } = getProjectGroups(sessions);
         const arg = parts.slice(1).join(" ").trim();
-        if (!arg) {
-          await ilinkSendText(userId, formatProjectsList(groups, order), contextToken);
+
+        // /s all → paginated list
+        if (arg === "all" || arg === "全部") {
+          const page = Math.max(0, parseInt(parts[2]) || 0);
+          const perPage = 8;
+          const totalPages = Math.ceil(sessions.length / perPage);
+          const start = page * perPage;
+          const chunk = sessions.slice(start, start + perPage);
+          const lines = [`📋 ${page + 1}/${totalPages} (${sessions.length} total)`];
+          chunk.forEach((s, j) => {
+            const dir = (s.directory || "").split(/[\/\\]/).filter(Boolean).pop() || "?";
+            const active = s.id === us.activeSession ? ">" : " ";
+            lines.push(`${active}${start + j} ${s.title} @${dir}`);
+          });
+          if (page + 1 < totalPages) lines.push(`→ /s all ${page + 1} 下一页`);
+          await sendToWeChat(userId, lines.join("\n"), contextToken);
           return;
         }
-        if (/^\d+$/.test(arg)) {
-          const idx = parseInt(arg);
-          if (idx >= 0 && idx < order.length) {
-            const dir = order[idx];
-            await ilinkSendText(userId, formatSessionsInProject(dir, groups[dir], us.activeSession), contextToken);
+
+        // /s <project> → filter
+        if (arg) {
+          const lower = arg.toLowerCase();
+          const keywords = lower.split(/\s+/).filter(Boolean);
+          const matchIdx = order.findIndex(d => keywords.every(k => d.toLowerCase().includes(k)));
+          if (matchIdx >= 0) {
+            const dir = order[matchIdx];
+            await sendToWeChat(userId, formatSessionsInProject(dir, groups[dir], us.activeSession), contextToken);
           } else {
-            await ilinkSendText(userId, `Project index ${idx} out of range (0-${order.length-1})`, contextToken);
+            // auto-fallback: unknown project → show all
+            const page = Math.max(0, parseInt(parts[2]) || 0);
+            const perPage = 8;
+            const totalPages = Math.ceil(sessions.length / perPage);
+            const start = page * perPage;
+            const chunk = sessions.slice(start, start + perPage);
+            const lines = [`📋 ${page + 1}/${totalPages} (${sessions.length} total)`];
+            chunk.forEach((s, j) => {
+              const dir = (s.directory || "").split(/[\/\\]/).filter(Boolean).pop() || "?";
+              const active = s.id === us.activeSession ? ">" : " ";
+              lines.push(`${active}${start + j} ${s.title} @${dir}`);
+            });
+            if (page + 1 < totalPages) lines.push(`→ /s all ${page + 1} 下一页`);
+            await sendToWeChat(userId, lines.join("\n"), contextToken);
           }
           return;
         }
-        const lower = arg.toLowerCase();
-        const keywords = lower.split(/\s+/).filter(Boolean);
-        const matchIdx = order.findIndex(d => keywords.every(k => d.toLowerCase().includes(k)));
-        if (matchIdx >= 0) {
-          const dir = order[matchIdx];
-          await ilinkSendText(userId, formatSessionsInProject(dir, groups[dir], us.activeSession), contextToken);
-        } else {
-          await ilinkSendText(userId, `No project matching "${arg}". Use /list to see all projects.`, contextToken);
+
+        // /s → summary
+        const recent = (us._recent || []).slice(0, 5);
+        const lines = [`📊 ${sessions.length} sessions · ${order.length} projects`];
+        if (recent.length > 0) {
+          lines.push("");
+          lines.push("🕐 Recent:");
+          recent.forEach((s, i) => {
+            const dir = (s.directory || "").split(/[\/\\]/).filter(Boolean).pop() || "?";
+            lines.push(`  ${i} ${s.title}  @${dir}`);
+          });
         }
+        lines.push("");
+        lines.push("📁 Projects:");
+        order.forEach(d => lines.push(`  ${d}  ${groups[d].length}  /s ${d}`));
+        lines.push("");
+        lines.push("→ /s all 全部  |  /r 切换");
+        await sendToWeChat(userId, lines.join("\n"), contextToken);
+        break;
+      }
+
+      case "/recent": {
+        let recent = us._recent || [];
+        // auto-populate from active session on first use
+        if (recent.length === 0 && us.activeSession) {
+          const sessions = await serveListAllSessions();
+          const cur = sessions.find(s => s.id === us.activeSession);
+          if (cur) { recordResume(userId, cur); recent = us._recent || []; }
+        }
+        if (recent.length === 0) {
+          await sendToWeChat(userId, "No recent sessions. /resume to switch first, or /s to browse.", contextToken);
+          return;
+        }
+        const arg = parts.slice(1).join(" ").trim();
+        if (arg && /^\d+$/.test(arg)) {
+          const idx = parseInt(arg);
+          if (idx >= 0 && idx < recent.length) {
+            us.activeSession = recent[idx].id;
+            us.activeDirectory = recent[idx].directory;
+            saveState(state);
+            await sendToWeChat(userId, `✅ ${recent[idx].title} (${recent[idx].id})`, contextToken);
+          } else {
+            await sendToWeChat(userId, `❌ Index ${idx} out of range (0-${recent.length - 1})`, contextToken);
+          }
+          return;
+        }
+        const lines = ["📌 Recent:"];
+        recent.forEach((s, i) => {
+          const dir = (s.directory || "").split(/[\/\\]/).filter(Boolean).pop() || "?";
+          const active = s.id === us.activeSession ? ">" : " ";
+          lines.push(`${active}${i} ${s.title}  @${dir}`);
+        });
+        lines.push("", "→ /r N 切换  |  /resume 名字 搜索");
+        await sendToWeChat(userId, lines.join("\n"), contextToken);
+        break;
+      }
+
+      case "/stats": {
+        const sessions = await serveListAllSessions();
+        if (sessions.length === 0) {
+          await sendToWeChat(userId, "No sessions.", contextToken);
+          return;
+        }
+        const { groups, order } = getProjectGroups(sessions);
+        const recent = us._recent || [];
+        const weekAgo = new Date(Date.now() - 7 * 24 * 3600000).toISOString();
+        const weekActive = recent.filter(s => s.ts >= weekAgo).length;
+        const lines = [`📊 ${sessions.length} total · ${order.length} projects · ${weekActive} active this week`];
+        const maxCount = Math.max(...order.map(d => groups[d].length), 1);
+        order.forEach(d => {
+          const count = groups[d].length;
+          const w = Math.round(count / maxCount * 10);
+          const bar = "█".repeat(w) + (w < 10 ? "▌" : "");
+          lines.push(`  ${d.padEnd(12)} ${String(count).padStart(2)}  ${bar}`);
+        });
+        await sendToWeChat(userId, lines.join("\n"), contextToken);
         break;
       }
 
@@ -524,7 +895,8 @@ async function handleCommand(userId, contextToken, text) {
         const session = await serveCreateSession(title);
         us.activeSession = session.id;
         saveState(state);
-        await ilinkSendText(userId, `✅ Created: ${session.id}\nTitle: ${title}`, contextToken);
+        recordResume(userId, session);
+        await sendToWeChat(userId, `✅ Created: ${session.id}\nTitle: ${title}`, contextToken);
         break;
       }
 
@@ -533,10 +905,10 @@ async function handleCommand(userId, contextToken, text) {
         const sessions = await serveListAllSessions();
         if (!query) {
           if (sessions.length === 0) {
-            await ilinkSendText(userId, "No sessions found.", contextToken);
+            await sendToWeChat(userId, "No sessions found.", contextToken);
           } else {
             const { groups, order } = getProjectGroups(sessions);
-            await ilinkSendText(userId, formatProjectsList(groups, order), contextToken);
+            await sendToWeChat(userId, formatProjectsList(groups, order), contextToken);
           }
           return;
         }
@@ -548,9 +920,10 @@ async function handleCommand(userId, contextToken, text) {
             us.activeSession = sessions[idx].id;
             us.activeDirectory = sessions[idx].directory;
             saveState(state);
-            await ilinkSendText(userId, `✅ Switched to: ${sessions[idx].title} (${sessions[idx].id})`, contextToken);
+            recordResume(userId, sessions[idx]);
+            await sendToWeChat(userId, `✅ Switched to: ${sessions[idx].title} (${sessions[idx].id})`, contextToken);
           } else {
-            await ilinkSendText(userId, `❌ Index ${idx} out of range (0-${sessions.length - 1})`, contextToken);
+            await sendToWeChat(userId, `❌ Index ${idx} out of range (0-${sessions.length - 1})`, contextToken);
           }
           return;
         }
@@ -561,9 +934,10 @@ async function handleCommand(userId, contextToken, text) {
             us.activeSession = match.id;
             us.activeDirectory = match.directory;
             saveState(state);
-            await ilinkSendText(userId, `✅ Switched to: ${match.title} (${match.id})`, contextToken);
+            recordResume(userId, match);
+            await sendToWeChat(userId, `✅ Switched to: ${match.title} (${match.id})`, contextToken);
           } else {
-            await ilinkSendText(userId, `❌ Session ${query} not found`, contextToken);
+            await sendToWeChat(userId, `❌ Session ${query} not found`, contextToken);
           }
           return;
         }
@@ -577,29 +951,45 @@ async function handleCommand(userId, contextToken, text) {
           us.activeSession = matches[0].id;
           us.activeDirectory = matches[0].directory;
           saveState(state);
-          await ilinkSendText(userId, `✅ Switched to: ${matches[0].title} (${matches[0].id})`, contextToken);
+          recordResume(userId, matches[0]);
+          await sendToWeChat(userId, `✅ Switched to: ${matches[0].title} (${matches[0].id})`, contextToken);
         } else if (matches.length > 1 && matches.length <= 5) {
           const lines = matches.map((s, i) => `[${i}] ${s.title} (${s.id})`);
-          await ilinkSendText(userId, `🔍 ${matches.length} matches:\n${lines.join("\n")}\nReply with "/resume [N]"`, contextToken);
+          await sendToWeChat(userId, `🔍 ${matches.length} matches:\n${lines.join("\n")}\nReply with "/resume [N]"`, contextToken);
         } else if (matches.length > 5) {
           const lines = matches.slice(0, 5).map((s, i) => `[${i}] ${s.title} (${s.id})`);
-          await ilinkSendText(userId, `🔍 ${matches.length} matches (showing first 5):\n${lines.join("\n")}\nNarrow your search`, contextToken);
+          await sendToWeChat(userId, `🔍 ${matches.length} matches (showing first 5):\n${lines.join("\n")}\nNarrow your search`, contextToken);
         } else {
-          await ilinkSendText(userId, `❌ No session matching "${query}"`, contextToken);
+          // No keyword match → substring search for closest
+          const subs = sessions.filter(s => {
+            const t = (s.title || "").toLowerCase();
+            return lowerQ.slice(0, 10).split(/\s+/).some(k => k.length >= 2 && t.includes(k));
+          }).slice(0, 5);
+          if (subs.length > 0) {
+            const lines = [`🔍 No exact match for "${query}". Closest:`];
+            subs.forEach(s => {
+              const dir = (s.directory || "").split(/[\/\\]/).filter(Boolean).pop() || "?";
+              lines.push(`  ${s.title}  @${dir}`);
+            });
+            lines.push("", "Try a shorter keyword like " + subs[0].title.split(/\s+/).slice(0, 2).join(" ") + " to switch.");
+            await sendToWeChat(userId, lines.join("\n"), contextToken);
+          } else {
+            await sendToWeChat(userId, `❌ No session found. /s to browse, /r for recent.`, contextToken);
+          }
         }
         break;
       }
 
       case "/model": {
         if (parts.length < 2) {
-          await ilinkSendText(userId,
+          await sendToWeChat(userId,
             `Current: ${us.model}\nAvailable: deepseek/deepseek-v4-pro, xiaomi/mimo-v2.5, xiaomi/mimo-v2.5-pro`,
             contextToken);
           return;
         }
         us.model = parts[1];
         saveState(state);
-        await ilinkSendText(userId, `✅ Model: ${us.model}`, contextToken);
+        await sendToWeChat(userId, `✅ Model: ${us.model}`, contextToken);
         break;
       }
 
@@ -607,7 +997,7 @@ async function handleCommand(userId, contextToken, text) {
         if (parts.length < 2) {
           const mode = nlActive ? "on" : "off";
           const info = nlOllamaAvailable ? ` (ollama: ${NL_CLASSIFY_MODEL})` : " (ollama unavailable, keywords only)";
-          await ilinkSendText(userId, `NL mode: ${mode}${info}`, contextToken);
+          await sendToWeChat(userId, `NL mode: ${mode}${info}`, contextToken);
           return;
         }
         const arg = parts[1].toLowerCase();
@@ -615,39 +1005,39 @@ async function handleCommand(userId, contextToken, text) {
           nlUserOverride = true;
           updateNlState();
           saveState(state);
-          await ilinkSendText(userId, "✅ NL mode on.", contextToken);
+          await sendToWeChat(userId, "✅ NL mode on.", contextToken);
         } else if (arg === "off" || arg === "关") {
           nlUserOverride = false;
           updateNlState();
           saveState(state);
-          await ilinkSendText(userId, "✅ NL mode off.", contextToken);
+          await sendToWeChat(userId, "✅ NL mode off.", contextToken);
         } else {
-          await ilinkSendText(userId, "Usage: /nl on | /nl off", contextToken);
+          await sendToWeChat(userId, "Usage: /nl on | /nl off", contextToken);
         }
         break;
       }
 
       case "/system": {
         if (parts.length < 2) {
-          await ilinkSendText(userId, `Current system prompt:\n"${us.systemPrompt}"\n\nUsage: /system <new prompt> or /system off`, contextToken);
+          await sendToWeChat(userId, `Current system prompt:\n"${us.systemPrompt}"\n\nUsage: /system <new prompt> or /system off`, contextToken);
           return;
         }
         const newPrompt = parts.slice(1).join(" ").trim();
         if (newPrompt.toLowerCase() === "off") {
           us.systemPrompt = "";
           saveState(state);
-          await ilinkSendText(userId, "✅ System prompt disabled.", contextToken);
+          await sendToWeChat(userId, "✅ System prompt disabled.", contextToken);
         } else {
           us.systemPrompt = newPrompt;
           saveState(state);
-          await ilinkSendText(userId, `✅ System prompt set:\n"${us.systemPrompt}"`, contextToken);
+          await sendToWeChat(userId, `✅ System prompt set:\n"${us.systemPrompt}"`, contextToken);
         }
         break;
       }
 
       case "/stop": {
         if (!us.activeSession) {
-          await ilinkSendText(userId, "No active session to stop.", contextToken);
+          await sendToWeChat(userId, "No active session to stop.", contextToken);
           return;
         }
         try {
@@ -657,17 +1047,17 @@ async function handleCommand(userId, contextToken, text) {
           pendingPermissions.delete(us.activeSession);
           turnReplies.delete(us.activeSession);
           pendingMessages.delete(us.activeSession);
-          await ilinkSendText(userId, "✅ Interrupt signal sent.", contextToken);
+          await sendToWeChat(userId, "✅ Interrupt signal sent.", contextToken);
         } catch (e) {
-          await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+          await sendToWeChat(userId, `❌ ${e.message}`, contextToken);
         }
         break;
       }
 
       case "/force": {
-        if (!us.activeSession) { await ilinkSendText(userId, "No active session.", contextToken); return; }
+        if (!us.activeSession) { await sendToWeChat(userId, "No active session.", contextToken); return; }
         const pending = pendingMessages.get(us.activeSession);
-        if (!pending) { await ilinkSendText(userId, "No pending message. Send a message first when the session is busy.", contextToken); return; }
+        if (!pending) { await sendToWeChat(userId, "No pending message. Send a message first when the session is busy.", contextToken); return; }
         pendingMessages.delete(us.activeSession);
         try {
           const sdk = await getSdk();
@@ -681,9 +1071,9 @@ async function handleCommand(userId, contextToken, text) {
           await serveSendMessageAsync(us.activeSession, pending.text, us.systemPrompt);
           activeTurns.set(us.activeSession, { userId, contextToken });
           turnReplies.set(us.activeSession, { text: "" });
-          await ilinkSendText(userId, `🔄 Interrupted. Sending: "${pending.text.slice(0, 50)}${pending.text.length > 50 ? "..." : ""}"`, contextToken);
+          await sendToWeChat(userId, `🔄 Interrupted. Sending: "${pending.text.slice(0, 50)}${pending.text.length > 50 ? "..." : ""}"`, contextToken);
         } catch (e) {
-          await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+          await sendToWeChat(userId, `❌ ${e.message}`, contextToken);
         } finally {
           inflight--;
         }
@@ -691,55 +1081,55 @@ async function handleCommand(userId, contextToken, text) {
       }
 
       case "/confirm": {
-        if (!us.activeSession) { await ilinkSendText(userId, "No active session.", contextToken); return; }
+        if (!us.activeSession) { await sendToWeChat(userId, "No active session.", contextToken); return; }
         const pp = pendingPermissions.get(us.activeSession);
-        if (!pp) { await ilinkSendText(userId, "No pending permission to confirm.", contextToken); return; }
+        if (!pp) { await sendToWeChat(userId, "No pending permission to confirm.", contextToken); return; }
         try {
           const sdk = await getSdk();
           await sdk.permission.respond({ sessionID: us.activeSession, permissionID: pp.permissionID, response: "once" });
-          await ilinkSendText(userId, "✅ Approved.", contextToken);
+          await sendToWeChat(userId, "✅ Approved.", contextToken);
         } catch (e) {
-          await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+          await sendToWeChat(userId, `❌ ${e.message}`, contextToken);
         }
         break;
       }
 
       case "/deny": {
-        if (!us.activeSession) { await ilinkSendText(userId, "No active session.", contextToken); return; }
+        if (!us.activeSession) { await sendToWeChat(userId, "No active session.", contextToken); return; }
         const pp = pendingPermissions.get(us.activeSession);
-        if (!pp) { await ilinkSendText(userId, "No pending permission to deny.", contextToken); return; }
+        if (!pp) { await sendToWeChat(userId, "No pending permission to deny.", contextToken); return; }
         try {
           const sdk = await getSdk();
           await sdk.permission.respond({ sessionID: us.activeSession, permissionID: pp.permissionID, response: "reject" });
-          await ilinkSendText(userId, "❌ Denied.", contextToken);
+          await sendToWeChat(userId, "❌ Denied.", contextToken);
         } catch (e) {
-          await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+          await sendToWeChat(userId, `❌ ${e.message}`, contextToken);
         }
         break;
       }
 
       case "/search": {
         const query = parts.slice(1).join(" ").trim();
-        if (!query) { await ilinkSendText(userId, "Usage: /search <keyword>", contextToken); return; }
+        if (!query) { await sendToWeChat(userId, "Usage: /search <keyword>", contextToken); return; }
         const sessions = await serveListAllSessions();
         const lowerQ = query.toLowerCase();
         const matches = sessions.filter(s => `${s.title} ${s.directory}`.toLowerCase().includes(lowerQ));
         if (matches.length === 0) {
-          await ilinkSendText(userId, `No sessions matching "${query}"`, contextToken);
+          await sendToWeChat(userId, `No sessions matching "${query}"`, contextToken);
         } else {
           const idMap = new Map(sessions.map((s, i) => [s.id, i]));
           const lines = matches.map(s => {
             const dir = s.directory.split(/[\/\\]/).filter(Boolean).pop() || "?";
             return `[${idMap.get(s.id)}] ${s.title} @${dir}`;
           });
-          await ilinkSendText(userId, `🔍 ${matches.length} matches:\n${lines.join("\n")}`, contextToken);
+          await sendToWeChat(userId, `🔍 ${matches.length} matches:\n${lines.join("\n")}`, contextToken);
         }
         break;
       }
 
       case "/delete": {
         const target = parts[1];
-        if (!target) { await ilinkSendText(userId, "Usage: /delete <id> or /delete [N]", contextToken); return; }
+        if (!target) { await sendToWeChat(userId, "Usage: /delete <id> or /delete [N]", contextToken); return; }
         const sessions = await serveListAllSessions();
         let session = null;
         if (target.startsWith("ses_")) session = sessions.find(s => s.id === target);
@@ -747,11 +1137,11 @@ async function handleCommand(userId, contextToken, text) {
           const idx = parseInt(target);
           if (idx >= 0 && idx < sessions.length) session = sessions[idx];
         }
-        if (!session) { await ilinkSendText(userId, `Session not found: ${target}`, contextToken); return; }
+        if (!session) { await sendToWeChat(userId, `Session not found: ${target}`, contextToken); return; }
         if (us._pendingDelete !== session.id) {
           us._pendingDelete = session.id;
           saveState(state);
-          await ilinkSendText(userId, `⚠️ Confirm delete: ${session.title} (${session.id})\nReply with /delete ${target} again to confirm.`, contextToken);
+          await sendToWeChat(userId, `⚠️ Confirm delete: ${session.title} (${session.id})\nReply with /delete ${target} again to confirm.`, contextToken);
           return;
         }
         us._pendingDelete = null;
@@ -761,17 +1151,17 @@ async function handleCommand(userId, contextToken, text) {
           await sdk.session.delete({ sessionID: session.id });
           if (us.activeSession === session.id) us.activeSession = null;
           saveState(state);
-          await ilinkSendText(userId, `✅ Deleted: ${session.title}`, contextToken);
+          await sendToWeChat(userId, `✅ Deleted: ${session.title}`, contextToken);
         } catch (e) {
-          await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+          await sendToWeChat(userId, `❌ ${e.message}`, contextToken);
         }
         break;
       }
 
       case "/compact": {
-        if (!us.activeSession) { await ilinkSendText(userId, "No active session.", contextToken); return; }
+        if (!us.activeSession) { await sendToWeChat(userId, "No active session.", contextToken); return; }
         try {
-          await ilinkSendText(userId, "⏳ Compacting...", contextToken);
+          await sendToWeChat(userId, "⏳ Compacting...", contextToken);
           const sdk = await getSdk();
           await sdk.session.abort({ sessionID: us.activeSession });
           await sleep(3000); // wait for abort to settle
@@ -784,32 +1174,32 @@ async function handleCommand(userId, contextToken, text) {
           us.activeSession = newSession.id;
           saveState(state);
           const summaryText = extractText(result.data.parts) || "(no summary)";
-          await ilinkSendText(userId, `✅ Compacted.\nNew session: ${newSession.id}\nSummary:\n${summaryText}`, contextToken);
+          await sendToWeChat(userId, `✅ Compacted.\nNew session: ${newSession.id}\nSummary:\n${summaryText}`, contextToken);
         } catch (e) {
-          await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+          await sendToWeChat(userId, `❌ ${e.message}`, contextToken);
         }
         break;
       }
 
       case "/current": {
-        await ilinkSendText(userId, `Session: ${us.activeSession || "(none)"}\nModel: ${us.model}`, contextToken);
+        await sendToWeChat(userId, `Session: ${us.activeSession || "(none)"}\nModel: ${us.model}`, contextToken);
         break;
       }
 
       case "/help": {
         const nlNote = nlActive ? "\n\n💬 NL mode ON — you can use natural language instead of commands." : "";
-        await ilinkSendText(userId,
-          "🛠 Commands:\n/list — Browse projects/sessions\n/new [title] — Create session\n/resume — List / fuzzy switch\n/stop — Interrupt current task\n/force — Interrupt & send queued message\n/confirm — Approve permission\n/deny — Deny permission\n/search <word> — Search sessions\n/delete <id> — Delete session\n/compact — Compress context to new session\n/model [name] — Show/switch model\n/system — Show/set system prompt\n/nl [on|off] — Toggle natural language mode\n/current — Show current state\n/help — This help" + nlNote,
+        await sendToWeChat(userId,
+          "🛠 /s sessions · /r recent · /st stats\n/sessions — Browse (summary + filter)\n/s all — All sessions paginated\n/r recent — Recent sessions\n/r N — Switch by recent index\n/st stats — Session statistics\n/n new [title] — Create session\n/resume <keyword> — Fuzzy search & switch\n/stop — Interrupt task\n/force — Interrupt & send queued\n/confirm — Approve permission\n/deny — Deny permission\n/search <word> — Search\n/delete <id> — Delete (double-confirm)\n/compact — Compress context\n/model [name] — Show/switch model\n/system — Show/set system prompt\n/nl [on|off] — NL mode\n/current — Current session\n/help — This help" + nlNote,
           contextToken);
         break;
       }
 
       default:
-        await ilinkSendText(userId, `Unknown: ${cmd}. Use /help.`, contextToken);
+        await sendToWeChat(userId, `Unknown: ${cmd}. Use /help.`, contextToken);
     }
   } catch (e) {
     log("error", "command failed", { cmd, error: e.message });
-    await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+    await sendToWeChat(userId, `❌ ${e.message}`, contextToken);
   }
 }
 
@@ -828,7 +1218,7 @@ async function handleMessage(msg) {
   text = text.trim();
   const hasMedia = Array.isArray(msg.item_list) && msg.item_list.some(item => item.type === 2 || item.type === 3 || item.type === 4 || item.type === 5);
   if (!text) {
-    if (hasMedia) await ilinkSendText(userId, "📷 收到图片/文件，当前模型不支持多媒体处理。请用文字描述。", contextToken);
+    if (hasMedia) await sendToWeChat(userId, "📷 收到图片/文件，当前模型不支持多媒体处理。请用文字描述。", contextToken);
     return;
   }
 
@@ -847,7 +1237,8 @@ async function handleMessage(msg) {
   }
 
   // NL classification
-  const { intent, args } = await nlClassifyIntent(text);
+  const sessions = await getSessions();
+  const { intent, args } = await nlClassifyIntent(text, us, sessions);
   if (intent !== "chat") {
     log("info", `nl routed`, { text: text.slice(0, 50), intent, args });
     const cmdText = `/${intent}${args ? " " + args : ""}`;
@@ -857,7 +1248,7 @@ async function handleMessage(msg) {
 
   // Regular message
   if (!us.activeSession) {
-    await ilinkSendText(userId, "⚠️ No active session. Use /list && /resume <id> first.", contextToken);
+    await sendToWeChat(userId, "⚠️ No active session. Use /list && /resume <id> first.", contextToken);
     return;
   }
 
@@ -871,25 +1262,26 @@ async function handleMessage(msg) {
       return;
     }
     pendingPermissions.delete(us.activeSession);
-    await ilinkSendText(userId, `❌ Denied previous request.\nForwarding: "${text.slice(0, 50)}${text.length > 50 ? "..." : ""}"\n\nRe-send your original message to retry.`, contextToken);
+    await sendToWeChat(userId, `❌ Denied previous request.\nForwarding: "${text.slice(0, 50)}${text.length > 50 ? "..." : ""}"\n\nRe-send your original message to retry.`, contextToken);
     return;
   }
 
   if (activeTurns.has(us.activeSession)) {
     pendingMessages.set(us.activeSession, { userId, contextToken, text });
-    await ilinkSendText(userId, `⏳ Session is busy. Reply /force to interrupt and send, or wait for the current task to finish.\n\nYour message: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"`, contextToken);
+    await sendToWeChat(userId, `⏳ Session is busy. Reply /force to interrupt and send, or wait for the current task to finish.\n\nYour message: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"`, contextToken);
     return;
   }
 
   try {
     inflight++;
+    log("debug", "turn start", { sid: us.activeSession.slice(0, 20), chars: text.length });
     await serveSendMessageAsync(us.activeSession, text, us.systemPrompt);
     activeTurns.set(us.activeSession, { userId, contextToken });
     turnReplies.set(us.activeSession, { text: "" });
-    await ilinkSendText(userId, "⏳ Processing...", contextToken);
+    await sendToWeChat(userId, "⏳ Processing...", contextToken);
   } catch (e) {
     log("error", "serve msg failed", { error: e.message });
-    await ilinkSendText(userId, `❌ ${e.message}`, contextToken);
+    await sendToWeChat(userId, `❌ ${e.message}`, contextToken);
   } finally {
     inflight--;
   }
@@ -974,6 +1366,9 @@ async function main() {
 
   log("info", "starting SSE listener");
   startSSEListener().catch(e => log("error", "SSE listener crashed", { error: e.message }));
+
+  // warm session cache
+  getSessions().catch(() => {});
 
   let buf = "";
   let backoff = 1000;
