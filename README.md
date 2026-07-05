@@ -145,6 +145,35 @@ node test-sse-live.js  # Full SSE chain: prompt_async → part → idle
 - Session listing blocks event loop ~1s (execSync). Acceptable for single-user.
 - NL LLM adds ~500ms per classification (keyword matches are instant).
 
+## Design Decisions
+
+### Why current implementation is appropriate for single-user
+
+| Implementation | Why it works | Why no improvement needed |
+|----------------|--------------|---------------------------|
+| `execSync` for session list | Blocks ~1s, acceptable for single user | Async would add complexity for no real benefit |
+| `writeFileSync` for logs | SSD write latency 0.1-1ms, imperceptible | Async batching only helps high-concurrency servers |
+| Fixed 5s SSE reconnect | Simple, predictable, works for personal use | Exponential backoff only matters for long outages |
+| Maps without TTL cleanup | Single user = max 1-2 active entries | Residual entries cost ~bytes, not worth added complexity |
+| Full NL prompt for LLM | Local Ollama, no token cost | Prompt compression only matters for API billing |
+
+### When these would need to change
+
+| Scenario | What would need improvement |
+|----------|---------------------------|
+| Multi-user deployment | Add Map TTL cleanup, connection pooling, rate limiting |
+| Cloud API billing (not local LLM) | Optimize prompt, add response caching |
+| Network storage (NFS) or HDD | Switch to async log writes |
+| High-availability requirement | Add exponential backoff, circuit breaker |
+| Cross-platform support | Replace `execSync` with async alternatives |
+
+### Key design trade-offs
+
+1. **Simplicity over robustness** — `execSync` is synchronous but simple; for single-user, simplicity wins
+2. **Local over remote** — Ollama means zero cost, so prompt size doesn't matter
+3. **Synchronous over async** — For single-user, blocking operations complete fast enough
+4. **Regex-first, LLM-fallback** — Keywords cover 90% of intents instantly; LLM only for edge cases
+
 ## License
 
 MIT
