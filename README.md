@@ -37,7 +37,7 @@ You don't need to remember commands. Say what you mean:
 
 | You say | Bridge does |
 |----------|-------------|
-| `切换专利` `打开 Pt催化实验` | Switch to session by fuzzy title match |
+| `切换微信桥项目` `打开 wechat-opencode-bridge项目` | Switch to session by fuzzy title match |
 | `列出` `全部` `看看` | Browse all sessions |
 | `最近` | Recent sessions |
 | `统计` | Session statistics |
