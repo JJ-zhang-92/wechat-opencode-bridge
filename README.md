@@ -3,7 +3,7 @@
 Control [OpenCode](https://github.com/anomalyco/opencode) directly from WeChat. Natural language in, natural language out — powered by local LLM (ollama qwen2.5:7b).
 
 ```
-微信 → ilink API → wx-bridge (Node.js) → OpenCode Serve → DeepSeek/V4 API
+微信 → ilink API → wx-bridge (Node.js) → OpenCode Serve →  API
                      ↕ ollama qwen2.5:7b
                   NL routing + output translation
 ```
